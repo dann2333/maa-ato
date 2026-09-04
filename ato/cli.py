@@ -29,11 +29,10 @@ from ato.gamedata.models import (
     resolve_range,
     resolve_skill,
 )
-from ato.gamedata.sources import TABLES
+from ato.gamedata.sources import TABLES, level_path
 from ato.gamedata.tables import GameData
 from ato.sim.pathing import route_waypoints
 from ato.sim.scenario import Difficulty, Scenario, compile_scenario
-from ato.sim.types import Tile
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -73,7 +72,7 @@ def _display_width(text: str) -> int:
 
 
 def _num(value: float) -> str:
-    if value != value or value in (float("inf"), float("-inf")):
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf: print as-is
         return str(value)
     if float(value).is_integer() and abs(value) < 1e15:
         return str(int(value))
@@ -126,7 +125,7 @@ def _wrap_items(items: Sequence[str], *, indent: str = "    ", width: int = 96) 
     lines: list[str] = []
     cur = indent
     for item in items:
-        if cur != indent and len(cur) + 1 + len(item) > width:
+        if cur != indent and _display_width(cur) + 1 + _display_width(item) > width:
             lines.append(cur)
             cur = indent
         cur += item if cur == indent else " " + item
@@ -138,10 +137,6 @@ def _wrap_items(items: Sequence[str], *, indent: str = "    ", width: int = 96) 
 def _kv(pairs: Sequence[tuple[str, Any]], *, indent: str = "  ") -> list[str]:
     width = max((len(k) for k, _ in pairs), default=0)
     return [f"{indent}{k.ljust(width)}  {_cell(v)}" for k, v in pairs]
-
-
-def _tile_str(t: Tile) -> str:
-    return f"({t.row},{t.col})"
 
 
 def _difficulty_name(mask: Difficulty) -> str:
@@ -238,6 +233,8 @@ def _find_operator(gd: GameData, token: str) -> tuple[str, dict[str, Any]]:
     if token in chars:
         return token, chars[token]
     low = token.lower()
+    # `low in (a, b)` is an equality test against either; the `partial` list below
+    # is the substring one.
     exact = [
         (k, v)
         for k, v in chars.items()
@@ -299,13 +296,15 @@ def cmd_gamedata_fetch(args: argparse.Namespace) -> int:
     missing = [t.name for t in TABLES if t.name not in manifest.files]
     if missing:
         print()
-        print("optional tables not present: " + ", ".join(missing))
+        print("declared in ato.gamedata.sources but absent here: " + ", ".join(missing))
     return EXIT_OK
 
 
 def _snapshot_row(path: Path) -> dict[str, Any]:
     manifest_path = path / "manifest.json"
-    version, server, stream, files = path.name.split("-", 1)[-1], path.name.split("-", 1)[0], "", 0
+    # Directories are named ``<server>-<version>``; the manifest wins when readable.
+    server, _, version = path.name.partition("-")
+    stream, files = "", 0
     if manifest_path.exists():
         try:
             m = Manifest.from_json(manifest_path.read_text("utf-8"))
@@ -457,11 +456,13 @@ def cmd_gamedata_diff(args: argparse.Namespace) -> int:
         adapt = _manifest_of
     else:
         adapt = Path  # it already is one; diff takes the directory itself
+    pair = (adapt(old), adapt(new))
     try:
-        result = fn(adapt(old), adapt(new))
+        result = fn(*pair)
     except (TypeError, AttributeError) as exc:
         print(
-            f"ato gamedata diff: not available yet (unexpected diff_snapshots signature: {exc})",
+            f"ato gamedata diff: diff_snapshots did not accept "
+            f"{type(pair[0]).__name__} arguments ({exc})",
             file=sys.stderr,
         )
         return EXIT_UNAVAILABLE
@@ -551,7 +552,11 @@ def _load_scenario(
     want = Difficulty.parse(difficulty or stage.get("difficulty") or "NORMAL")
     try:
         level = gd.level_json(level_id)
-    except (RuntimeError, OSError, ValueError) as exc:
+    except ValueError as exc:
+        # A cached 404 body parses as garbage; say which file to delete.
+        cached = gd.root / "levels" / level_path(level_id)
+        raise CliError(f"level {level_id} is not valid JSON ({exc}); delete {cached}") from exc
+    except (RuntimeError, OSError) as exc:
         raise CliError(f"could not load level {level_id}: {exc}") from exc
     # strict=False: an unmodelled mechanic must be reported, not raised, when a
     # human is only looking at the stage.
@@ -668,93 +673,73 @@ def _novelty_rows(scenario: Scenario) -> list[dict[str, str]]:
     ]
 
 
-def cmd_stage_show(args: argparse.Namespace) -> int:
-    gd = _open_gamedata(args.server)
-    stage_id, stage, want, sc = _load_scenario(gd, args.stage, args.difficulty)
-    tiles = _tile_summary(sc)
-    timeline = _timeline(sc)
-    enemies = _enemy_rows(sc, gd)
-    novelty = _novelty_rows(sc)
-    options = {f.name: getattr(sc.options, f.name) for f in dataclasses.fields(sc.options)}
-    runes = [
-        {
-            "key": r.key,
-            "difficulty_mask": _difficulty_name(r.difficulty_mask),
-            "blackboard": r.blackboard,
-            "value_str": r.value_str,
-            "profession_mask": r.profession_mask,
-            "buildable_mask": r.buildable_mask,
-        }
-        for r in sc.runes
-    ]
-    predefined = [
-        {
-            "char_key": p.char_key,
-            "tile": {"row": p.tile.row, "col": p.tile.col},
-            "direction": p.direction.name,
-            "level": p.level,
-            "phase": p.phase,
-            "skill_index": p.skill_index,
-            "hidden": p.hidden,
-            "is_token": p.is_token,
-            "alias": p.alias,
-        }
-        for p in sc.predefined
-    ]
-
-    if args.as_json:
-        _dump_json(
+def _stage_payload(
+    gd: GameData, stage_id: str, stage: dict[str, Any], want: Difficulty, sc: Scenario
+) -> dict[str, Any]:
+    """One description of the scenario, feeding both the JSON and the text
+    renderer, so the two can never disagree about what the stage contains."""
+    return {
+        "stage": {
+            "stageId": stage_id,
+            "code": stage.get("code"),
+            "name": stage.get("name"),
+            "apCost": stage.get("apCost"),
+            "stageType": stage.get("stageType"),
+            "difficulty": stage.get("difficulty"),
+            "levelId": stage.get("levelId"),
+        },
+        "gamedata_version": gd.version,
+        "gamedata_server": gd.server,
+        "difficulty_applied": _difficulty_name(want),
+        "map": {**_tile_summary(sc), "ascii": sc.bmap.ascii()},
+        "waves": _timeline(sc),
+        "wave_count": len(sc.waves),
+        "enemy_count": sc.enemy_count,
+        "enemies": _enemy_rows(sc, gd),
+        "runes": [
             {
-                "stage": {
-                    "stageId": stage_id,
-                    "code": stage.get("code"),
-                    "name": stage.get("name"),
-                    "apCost": stage.get("apCost"),
-                    "stageType": stage.get("stageType"),
-                    "difficulty": stage.get("difficulty"),
-                    "levelId": stage.get("levelId"),
-                },
-                "gamedata_version": gd.version,
-                "difficulty_applied": _difficulty_name(want),
-                "map": {**tiles, "ascii": sc.bmap.ascii()},
-                "waves": timeline,
-                "wave_count": len(sc.waves),
-                "enemy_count": sc.enemy_count,
-                "enemies": enemies,
-                "runes": runes,
-                "options": options,
-                "predefined": predefined,
-                "excluded_chars": sorted(sc.excluded_chars),
-                "random_seed": sc.random_seed,
-                "novelty": novelty,
+                "key": r.key,
+                "difficulty_mask": _difficulty_name(r.difficulty_mask),
+                "blackboard": r.blackboard,
+                "value_str": r.value_str,
+                "profession_mask": r.profession_mask,
+                "buildable_mask": r.buildable_mask,
             }
-        )
-        return EXIT_OK
+            for r in sc.runes
+        ],
+        "options": {f.name: getattr(sc.options, f.name) for f in dataclasses.fields(sc.options)},
+        "predefined": [
+            {
+                "char_key": u.char_key,
+                "tile": {"row": u.tile.row, "col": u.tile.col},
+                "direction": u.direction.name,
+                "level": u.level,
+                "phase": u.phase,
+                "skill_index": u.skill_index,
+                "hidden": u.hidden,
+                "is_token": u.is_token,
+                "alias": u.alias,
+            }
+            for u in sc.predefined
+        ],
+        "excluded_chars": sorted(sc.excluded_chars),
+        "random_seed": sc.random_seed,
+        "novelty": _novelty_rows(sc),
+    }
 
-    _emit(
-        _kv(
-            [
-                ("stage", f"{stage_id}  {stage.get('code') or ''}  {stage.get('name') or ''}"),
-                ("levelId", stage.get("levelId")),
-                ("type", f"{stage.get('stageType')}  ap {stage.get('apCost')}"),
-                ("difficulty", f"{_difficulty_name(want)}  (stage says {stage.get('difficulty')})"),
-                ("gamedata", f"{gd.version} [{gd.server}]"),
-                ("seed", sc.random_seed),
-            ]
-        )
-    )
 
-    print()
+def _render_map(tiles: dict[str, Any]) -> None:
     print(_rule(f"map {tiles['width']}x{tiles['height']}"))
-    print(sc.bmap.ascii())
+    print(tiles["ascii"])
     print("  legend  . road   m melee-buildable   r ranged-buildable   # wall   _ floor")
     print("          S start  s fly-start         E end                o hole   (blank) forbidden")
-    print(
-        f"  starts  {' '.join(_tile_str(t) for t in sc.bmap.starts) or '-'}"
-        f"\n  ends    {' '.join(_tile_str(t) for t in sc.bmap.ends) or '-'}"
-    )
+    print("          ? = a tile kind with no ascii symbol; see the table below")
+    starts = " ".join(f"({t['row']},{t['col']})" for t in tiles["starts"]) or "-"
+    ends = " ".join(f"({t['row']},{t['col']})" for t in tiles["ends"]) or "-"
+    print(f"  starts  {starts}\n  ends    {ends}")
 
-    print()
+
+def _render_tiles(tiles: dict[str, Any], character_limit: int) -> None:
     print(_rule("deployable tiles"))
     _emit(
         _table(
@@ -772,15 +757,22 @@ def cmd_stage_show(args: argparse.Namespace) -> int:
                 ("melee positions", tiles["melee_deployable"]),
                 ("ranged positions", tiles["ranged_deployable"]),
                 ("blocked by tilesDisallowToLocate", tiles["blocked_by_tilesDisallowToLocate"]),
-                ("character limit", sc.options.character_limit),
+                ("character limit", character_limit),
             ]
         )
     )
 
-    print()
-    spawn_actions = sum(1 for r in timeline if r["spawns"])
-    print(_rule(f"waves: {len(sc.waves)}, {spawn_actions} spawn actions, {sc.enemy_count} enemies"))
-    names = {e["key"]: e["name"] for e in enemies}
+
+def _render_waves(payload: dict[str, Any]) -> None:
+    timeline = payload["waves"]
+    spawns = sum(1 for r in timeline if r["spawns"])
+    print(
+        _rule(
+            f"waves: {payload['wave_count']}, {spawns} spawn actions, "
+            f"{payload['enemy_count']} enemies"
+        )
+    )
+    names = {e["key"]: e["name"] for e in payload["enemies"]}
     rows = []
     for r in timeline:
         flags = []
@@ -816,7 +808,8 @@ def cmd_stage_show(args: argparse.Namespace) -> int:
     )
     print("  times are the earliest possible; blockFragment / wave waits can push them later")
 
-    print()
+
+def _render_enemies(enemies: list[dict[str, Any]]) -> None:
     print(_rule(f"enemies: {len(enemies)} types"))
     _emit(
         _table(
@@ -837,74 +830,112 @@ def cmd_stage_show(args: argparse.Namespace) -> int:
         )
     )
 
-    print()
-    print(_rule(f"runes active for {_difficulty_name(want)}: {len(runes)}"))
-    if runes:
-        _emit(
-            _table(
-                ("key", "mask", "blackboard", "professionMask", "buildableMask"),
-                [
-                    (
-                        r["key"],
-                        r["difficulty_mask"],
-                        " ".join(
-                            f"{k}={_num(v)}" for k, v in sorted(r["blackboard"].items())
-                        )
-                        + "".join(f" {k}={v!r}" for k, v in sorted(r["value_str"].items())),
-                        r["profession_mask"],
-                        r["buildable_mask"],
-                    )
-                    for r in runes
-                ],
-                align="lllrl",
-            )
-        )
-    else:
+
+def _render_runes(runes: list[dict[str, Any]], difficulty: str) -> None:
+    print(_rule(f"runes active for {difficulty}: {len(runes)}"))
+    if not runes:
         print("  none")
-
-    print()
-    print(_rule("battle options"))
-    _emit(_kv(sorted(options.items())))
-    if sc.excluded_chars:
-        print("  excluded chars  " + ", ".join(sorted(sc.excluded_chars)))
-
-    if predefined:
-        print()
-        print(_rule(f"predefined units: {len(predefined)}"))
-        _emit(
-            _table(
-                ("charKey", "tile", "dir", "phase", "level", "skill", "token", "hidden", "alias"),
-                [
-                    (
-                        p["char_key"],
-                        f"({p['tile']['row']},{p['tile']['col']})",
-                        p["direction"],
-                        p["phase"],
-                        p["level"],
-                        p["skill_index"],
-                        p["is_token"],
-                        p["hidden"],
-                        p["alias"],
-                    )
-                    for p in predefined
-                ],
-                align="lllrrrlll",
-            )
+        return
+    _emit(
+        _table(
+            ("key", "mask", "blackboard", "professionMask", "buildableMask"),
+            [
+                (
+                    r["key"],
+                    r["difficulty_mask"],
+                    " ".join(f"{k}={_num(v)}" for k, v in sorted(r["blackboard"].items()))
+                    + "".join(f" {k}={v!r}" for k, v in sorted(r["value_str"].items())),
+                    r["profession_mask"],
+                    r["buildable_mask"],
+                )
+                for r in runes
+            ],
+            align="lllrl",
         )
+    )
 
-    print()
-    if novelty:
-        print(_rule(f"NOVELTY: {len(novelty)} unmodelled mechanics"))
-        _emit(
-            _table(
-                ("kind", "key", "context"),
-                [(n["kind"], n["key"], n["context"]) for n in novelty],
-            )
+
+def _render_predefined(units: list[dict[str, Any]]) -> None:
+    print(_rule(f"predefined units: {len(units)}"))
+    _emit(
+        _table(
+            ("charKey", "tile", "dir", "phase", "level", "skill", "token", "hidden", "alias"),
+            [
+                (
+                    u["char_key"],
+                    f"({u['tile']['row']},{u['tile']['col']})",
+                    u["direction"],
+                    u["phase"],
+                    u["level"],
+                    u["skill_index"],
+                    u["is_token"],
+                    u["hidden"],
+                    u["alias"],
+                )
+                for u in units
+            ],
+            align="lllrrrlll",
         )
-        print("  strict=True would refuse this scenario; each line is a mechanic to implement")
-    else:
+    )
+
+
+def _render_novelty(novelty: list[dict[str, str]]) -> None:
+    if not novelty:
         print(_rule("NOVELTY: none"))
         print("  every mechanic in this level is registered")
+        return
+    print(_rule(f"NOVELTY: {len(novelty)} unmodelled mechanics"))
+    _emit(_table(("kind", "key", "context"), [(n["kind"], n["key"], n["context"]) for n in novelty]))
+    print("  strict=True would refuse this scenario; each line is a mechanic to implement")
+
+
+def _render_stage(payload: dict[str, Any]) -> None:
+    st = payload["stage"]
+    _emit(
+        _kv(
+            [
+                ("stage", f"{st['stageId']}  {st['code'] or ''}  {st['name'] or ''}"),
+                ("levelId", st["levelId"]),
+                ("type", f"{st['stageType']}  ap {st['apCost']}"),
+                (
+                    "difficulty",
+                    f"{payload['difficulty_applied']}  (stage says {st['difficulty']})",
+                ),
+                ("gamedata", f"{payload['gamedata_version']} [{payload['gamedata_server']}]"),
+                ("seed", payload["random_seed"]),
+            ]
+        )
+    )
+    print()
+    _render_map(payload["map"])
+    print()
+    _render_tiles(payload["map"], payload["options"]["character_limit"])
+    print()
+    _render_waves(payload)
+    print()
+    _render_enemies(payload["enemies"])
+    print()
+    _render_runes(payload["runes"], payload["difficulty_applied"])
+    print()
+    print(_rule("battle options"))
+    _emit(_kv(sorted(payload["options"].items())))
+    if payload["excluded_chars"]:
+        print("  excluded chars  " + ", ".join(payload["excluded_chars"]))
+    if payload["predefined"]:
+        print()
+        _render_predefined(payload["predefined"])
+    print()
+    _render_novelty(payload["novelty"])
+
+
+def cmd_stage_show(args: argparse.Namespace) -> int:
+    gd = _open_gamedata(args.server)
+    stage_id, stage, want, sc = _load_scenario(gd, args.stage, args.difficulty)
+    payload = _stage_payload(gd, stage_id, stage, want, sc)
+    if args.as_json:
+        _dump_json(payload)
+        return EXIT_OK
+    _render_stage(payload)
     return EXIT_OK
 
 
@@ -988,7 +1019,7 @@ def _describe(text: str, blackboard: dict[str, float]) -> str:
     """Render a skill/talent description: strip rich-text tags, fill in values.
 
     Descriptions carry ``{key}`` / ``{key:0%}`` placeholders resolved against the
-    level's blackboard; an unresolvable one is left verbatim rather than guessed.
+    skill's own blackboard; an unresolvable one is left verbatim, not guessed.
     """
     lower = {k.lower(): v for k, v in blackboard.items()}
 
@@ -1090,7 +1121,11 @@ def _operator_payload(
                 "name": cand.get("name") or "",
                 "description": _describe(
                     cand.get("description") or "",
-                    {b["key"]: b["value"] for b in (cand.get("blackboard") or [])},
+                    {
+                        b["key"]: float(b.get("value") or 0.0)
+                        for b in (cand.get("blackboard") or [])
+                        if b.get("key")
+                    },
                 ),
                 "phase": PHASE_INDEX.get(str(cond.get("phase") or "PHASE_0"), 0),
                 "level": int(cond.get("level") or 1),

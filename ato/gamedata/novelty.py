@@ -394,8 +394,14 @@ class IngestionPlan:
 
     @property
     def blocking(self) -> list[NoveltyItem]:
-        """Mechanisms severe enough that training on affected content is invalid."""
-        return [i for i in self.code if i.priority >= SIM_CORRUPTION_PRIORITY]
+        """Mechanisms severe enough that training on affected content is invalid.
+
+        Scans every bucket: a mechanic no one can explain (``ask_human``)
+        falsifies simulation exactly as much as one waiting on a handler.
+        """
+        return [
+            i for i in self.items if i.is_mechanism and i.priority >= SIM_CORRUPTION_PRIORITY
+        ]
 
     def counts(self) -> dict[str, int]:
         return {b: len(getattr(self, b)) for b in BUCKETS}
@@ -418,6 +424,9 @@ class IngestionPlan:
             f"ingestion plan — {self.label or 'unlabelled'}",
             f"  {len(self.items)} items: {head}",
         ]
+        if not self.items:
+            lines.append("  nothing to ingest — the snapshots agree and the simulator met "
+                         "no unknown mechanic")
         if self.blocking:
             lines += [
                 "",

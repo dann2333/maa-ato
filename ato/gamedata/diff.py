@@ -98,6 +98,9 @@ MAX_COMBAT_SAMPLES = 16
 MAX_NODES = 20_000
 
 _IDENT = re.compile(r"[^.\[\]]+")
+#: ``enemy_database`` boxes every field as ``{m_defined, m_value}``; the box is
+#: not part of a field's identity, so path names see through it.
+_WRAPPER_SEGMENTS = frozenset({"m_value", "m_defined"})
 _MISSING = object()
 #: Fields a record can be indexed by inside a list, so that a reordered list of
 #: blackboard entries or key frames is not reported as a change.
@@ -118,19 +121,19 @@ def rarity_index(raw: Any) -> int:
 
 
 def leaf_name(path: str) -> str:
-    """Last identifier of a leaf path: ``phases[1].data.atk`` -> ``atk``."""
-    segs = _IDENT.findall(path)
+    """Field a leaf path names: ``phases[1].data.atk`` -> ``atk``, box removed."""
+    segs = [s for s in _IDENT.findall(path) if s not in _WRAPPER_SEGMENTS]
     return segs[-1] if segs else path
 
 
 def is_combat_path(path: str, entity_type: str = "") -> bool:
     """True if a changed leaf can move a battle's outcome."""
-    segs = _IDENT.findall(path)
-    if segs and segs[-1] in COSMETIC_FIELDS:
+    leaf = leaf_name(path)
+    if leaf in COSMETIC_FIELDS:
         return False
     if entity_type == EntityType.LEVEL:
-        return not segs or segs[-1] not in LEVEL_COSMETIC_FIELDS
-    return any(s in COMBAT_FIELDS or s in COMBAT_CONTAINERS for s in segs)
+        return leaf not in LEVEL_COSMETIC_FIELDS
+    return any(s in COMBAT_FIELDS or s in COMBAT_CONTAINERS for s in _IDENT.findall(path))
 
 
 @dataclass
@@ -328,7 +331,7 @@ def diff_entity(
 # know about it without re-opening the table.
 # ---------------------------------------------------------------------------
 
-Meta = Callable[[str, Any], "tuple[str, dict[str, Any]]"]
+Meta = Callable[[str, Any], tuple[str, dict[str, Any]]]
 
 
 def _operator_meta(char_id: str, entry: Any) -> tuple[str, dict[str, Any]]:
@@ -514,7 +517,8 @@ class SnapshotDiff:
         lines = [
             f"gamedata diff  {self.server}  {self.old_version} -> {self.new_version}",
             f"  tables: {len(self.unchanged_tables)} unchanged (hash), "
-            f"{len(self.skipped_tables)} unavailable",
+            f"{len(self.skipped_tables)} unavailable"
+            + (f" ({', '.join(sorted(self.skipped_tables))})" if self.skipped_tables else ""),
         ]
         counts = self.counts()
         for etype in sorted(counts):
@@ -570,13 +574,9 @@ def _same_hash(old: GameData, new: GameData, table: str) -> bool:
     return bool(o and n and o.sha256 and o.sha256 == n.sha256)
 
 
-def _load(gd: GameData, table: str) -> Any:
-    return gd.table(table)
-
-
 def _mapping(gd: GameData, table: str) -> dict[str, Any]:
     """The entity mapping inside a table, whatever shape the table has."""
-    raw = _load(gd, table)
+    raw = gd.table(table)
     if table == "stage_table":
         return raw["stages"]
     if table == "enemy_database":
@@ -588,7 +588,7 @@ def _mapping(gd: GameData, table: str) -> dict[str, Any]:
 
 def _optional(gd: GameData, table: str) -> dict[str, Any]:
     try:
-        return _load(gd, table)
+        return gd.table(table)
     except (FileNotFoundError, KeyError):
         return {}
 
@@ -650,6 +650,11 @@ def diff_snapshots(
             old_map, new_map = _mapping(old, table), _mapping(new, table)
         except FileNotFoundError as exc:
             diff.skipped_tables[table] = str(exc)
+            continue
+        except (KeyError, TypeError, AttributeError) as exc:
+            # A table whose shape moved is news, but it must not abort the diff
+            # of the other tables — it is reported, never silently dropped.
+            diff.skipped_tables[table] = f"unreadable ({type(exc).__name__}: {exc})"
             continue
         diff.changes.extend(
             _diff_mapping(entity_type, table, old_map, new_map, meta, max_paths=max_paths)
