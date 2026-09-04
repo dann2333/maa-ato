@@ -249,6 +249,7 @@ def rollout(
     index: PlacementIndex,
     *,
     horizon: float | None = None,
+    defer: float = 0.0,
 ) -> float:
     """Play the battle out with a cheap default policy and score the result.
 
@@ -258,12 +259,13 @@ def rollout(
     """
     sim = engine.clone()
     limit = horizon if horizon is not None else sim.max_seconds
+    hold_until = sim.state.time + defer
     next_try = 0.0
     while sim.state.result is BattleResult.RUNNING and sim.state.time < limit:
         sim.tick()
         # Deploying only every half second keeps the rollout cheap and matches
         # the granularity a human plays at.
-        if sim.state.time >= next_try:
+        if sim.state.time >= next_try and sim.state.time >= hold_until:
             next_try = sim.state.time + 0.5
             best = index.first_legal(sim)
             if best is not None:
@@ -316,13 +318,38 @@ def plan_stage(engine: BattleEngine, cfg: PlannerConfig | None = None) -> PlanRe
         next_decision = live.state.time + cfg.decision_interval
 
         cands = index.legal(live, top_k=cfg.branch)
-        if not cands or used >= cfg.rollout_budget:
+        if not cands:
+            continue
+
+        if used >= cfg.rollout_budget:
+            # Out of search budget: fall back to the default policy rather than
+            # standing still. A planner that stops deploying when it stops
+            # thinking loses stages it had already half-won.
+            fallback = index.first_legal(live)
+            if fallback is not None:
+                # Capture DP *before* deploying: the trigger is the level at
+                # which the action becomes possible, and deploy has already
+                # spent it by the time the unit exists.
+                dp = float(int(live.state.cost))
+                if live.deploy(fallback.char_id, fallback.tile, fallback.direction) is not None:
+                    steps.append(
+                        PlanStep(
+                            action=fallback.to_action(),
+                            trigger=Trigger(TriggerKind.COST, dp),
+                            note=f"greedy fallback t={live.state.time:.1f}s",
+                        )
+                    )
             continue
 
         best_score = -math.inf
         best: Candidate | None = None
         if cfg.consider_waiting:
-            best_score = rollout(live, heur, index)
+            # The waiting branch has to actually wait. Rolling out with the
+            # default policy would deploy immediately anyway, making the
+            # baseline indistinguishable from acting -- which is exactly the bug
+            # that made an earlier version of this planner deploy nothing at all
+            # and lose a stage its own rollout policy could clear.
+            best_score = rollout(live, heur, index, defer=cfg.decision_interval)
             used += 1
 
         for c in cands:
@@ -337,16 +364,17 @@ def plan_stage(engine: BattleEngine, cfg: PlannerConfig | None = None) -> PlanRe
                 best_score, best = s, c
 
         if best is not None:
-            unit = live.deploy(best.char_id, best.tile, best.direction)
-            if unit is not None:
+            # DP is the most reliable trigger a screen-reading agent has: a
+            # large, high-contrast integer that moves deterministically. Read it
+            # before the deploy spends it.
+            dp = float(int(live.state.cost))
+            kills = live.state.kills
+            if live.deploy(best.char_id, best.tile, best.direction) is not None:
                 steps.append(
                     PlanStep(
                         action=best.to_action(),
-                        # DP is the most reliable trigger a screen-reading agent
-                        # has: it is a large, high-contrast integer and it moves
-                        # deterministically.
-                        trigger=Trigger(TriggerKind.COST, float(int(live.state.cost))),
-                        note=f"t={live.state.time:.1f}s kills={live.state.kills}",
+                        trigger=Trigger(TriggerKind.COST, dp),
+                        note=f"t={live.state.time:.1f}s kills={kills}",
                     )
                 )
 
