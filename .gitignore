@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Game data snapshots and derived artifacts are NEVER committed:
+# they are third-party copyrighted content, fetched locally on demand.
+data/gamedata/
+data/snapshots/
+data/video/
+data/assets/
+data/replays/
+data/runs/
+*.onnx
+*.pt
+*.ckpt

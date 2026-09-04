@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ato"
+version = "0.1.0"
+description = "ATO — an Arknights-playing AI: offline battle simulator, search + imitation + RL, continual learning"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+train = ["torch>=2.2", "onnx>=1.15", "onnxruntime>=1.17"]
+device = ["opencv-python-headless>=4.9", "av>=12.0"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.5", "mypy>=1.10"]
+
+[project.scripts]
+ato = "ato.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ato*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["slow: long-running tests", "netaccess: requires network"]
