@@ -296,7 +296,18 @@ class TouchPipe:
 
     # -- protocol ----------------------------------------------------------- #
 
-    def _write(self, payload: str) -> None:
+    def _write(self, payload: str, queued_ms: float = 0.0) -> None:
+        """Send a batch, then wait out the time the device will spend on it.
+
+        The helper protocol's ``w`` command is executed *on the device*, while
+        this write returns the moment the bytes are flushed. Without the wait the
+        two backends disagree about time: a caller that asks for a 1080 ms
+        gesture gets one that returns in roughly half that, and any settle delay
+        it queued is swallowed -- on a deployment that means the facing flick
+        fires before the direction selector has appeared, so the operator faces
+        the wrong way. The ``input`` fallback blocks naturally, so this is what
+        makes the two agree.
+        """
         if not self.alive or self.proc is None or self.proc.stdin is None:
             raise DeviceUnavailable("touch helper pipe is closed")
         try:
@@ -304,6 +315,8 @@ class TouchPipe:
             self.proc.stdin.flush()
         except OSError as exc:
             raise DeviceUnavailable(f"touch helper pipe broke: {exc}") from exc
+        if queued_ms > 0.0:
+            time.sleep(queued_ms / 1000.0)
 
     def _scale(self, x: float, y: float) -> tuple[int, int]:
         """Screen pixels -> touch-device units. They differ on real hardware; on
@@ -333,7 +346,10 @@ class TouchPipe:
     def tap(self, x: float, y: float, *, hold_ms: float = 60.0, contact: int = 0) -> None:
         tx, ty = self._scale(x, y)
         p = self._pressure()
-        self._write(f"d {contact} {tx} {ty} {p}\nc\nw {int(hold_ms)}\nu {contact}\nc\n")
+        self._write(
+            f"d {contact} {tx} {ty} {p}\nc\nw {int(hold_ms)}\nu {contact}\nc\n",
+            queued_ms=hold_ms,
+        )
 
     def swipe(
         self,
@@ -359,7 +375,8 @@ class TouchPipe:
         # The client samples the last position before the lift; without this dwell
         # a fast drag can be read as a flick past the target.
         out += [f"w {int(settle_ms)}", f"u {contact}", "c"]
-        self._write("\n".join(out) + "\n")
+        queued = per_step * segments * steps_per_segment + settle_ms
+        self._write("\n".join(out) + "\n", queued_ms=queued)
 
     def long_press(self, x: float, y: float, ms: float, *, contact: int = 0) -> None:
         self.tap(x, y, hold_ms=ms, contact=contact)
@@ -479,6 +496,10 @@ class AdbDevice(DeviceController):
                 online = [s for s, state in self.devices() if state == "device"]
                 if self.address in online:
                     self.serial = self.address
+        # The 500 ms probe cache was almost certainly filled with False by
+        # whoever asked "are we connected?" immediately before calling this.
+        # Answering from it would report failure for a device that just came up.
+        self._probe = (0.0, False)
         return self.connected
 
     def _resolve_serial(self) -> str:
@@ -516,7 +537,16 @@ class AdbDevice(DeviceController):
         return value
 
     def _require(self) -> str:
-        if self.address and not self.connected:
+        """Resolve the serial for an action, paying at most one `adb devices`.
+
+        ``connected`` already resolves as a side effect and caches the answer;
+        calling ``_resolve_serial`` again afterwards spawned a second process for
+        every frame and every touch, which is exactly what the cache exists to
+        avoid.
+        """
+        if self.connected and self.serial:
+            return self.serial
+        if self.address:
             self.connect()
         return self._resolve_serial()
 
@@ -661,17 +691,20 @@ class AdbDevice(DeviceController):
             if pipe is not None:
                 pipe.swipe(pts, duration_ms)
                 return
-            # `input swipe` takes exactly two points and lifts at the end of each
-            # call, so a polyline becomes several strokes — good enough to aim a
-            # deploy, not good enough for a gesture the client tracks continuously.
-            per = max(1, int(duration_ms / (len(pts) - 1)))
-            for (ax, ay), (bx, by) in zip(pts[:-1], pts[1:], strict=True):
-                self._run(
-                    self._args(
-                        "shell", "input", "swipe",
-                        str(int(ax)), str(int(ay)), str(int(bx)), str(int(by)), str(per),
-                    )
+            # `input swipe` presses down and lifts within a single call, so
+            # emitting one call per segment would turn a deployment drag into
+            # several disjoint strokes: the card gets released partway to the
+            # tile and the deploy never lands. Collapse to one stroke instead and
+            # accept that intermediate waypoints are lost -- a straight drag is
+            # what the client needs, and it is what a player does anyway.
+            (ax, ay), (bx, by) = pts[0], pts[-1]
+            self._run(
+                self._args(
+                    "shell", "input", "swipe",
+                    str(int(ax)), str(int(ay)), str(int(bx)), str(int(by)),
+                    str(max(1, int(duration_ms))),
                 )
+            )
 
     def long_press(self, x: float, y: float, ms: float) -> None:
         self._require()

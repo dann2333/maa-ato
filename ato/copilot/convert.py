@@ -35,6 +35,7 @@ from ato.copilot.schema import (
     CopilotDoc,
     CopilotOper,
     DeployDirection,
+    SkillUsage,
 )
 from ato.sim.registry import MechanismKind, NoveltyLog
 from ato.sim.types import Direction, Tile
@@ -44,6 +45,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 #: MAA delays are milliseconds; ATO time is seconds.
 _MS = 1000.0
+
+#: Valid SkillUsage values, so a round trip cannot resurrect an out-of-range one.
+_SKILL_USAGE_VALUES = frozenset(int(u) for u in SkillUsage)
 
 #: Fixture behind :func:`location_to_tile`, kept in code so the convention can
 #: be re-checked (or flipped) in one place.  Each row is
@@ -112,11 +116,34 @@ def location_to_display_tile(location: Sequence[int]) -> Tile:
     return Tile(int(location[1]), int(location[0]))
 
 
-def tile_to_location(tile: Tile, map_height: int | None = None) -> list[int]:
-    """Inverse of :func:`location_to_tile` (or of the display reading if
-    ``map_height`` is None)."""
-    y = tile.row if map_height is None else map_height - 1 - tile.row
-    return [tile.col, y]
+class _DisplayRows:
+    """Sentinel: keep copilot display rows as they are, do not convert."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "DISPLAY_ROWS"
+
+
+#: Pass this as ``map_height`` to state that the rows are already copilot display
+#: rows and no conversion is wanted. Spelling it out is the point: copilot counts
+#: rows from the top of the map and ATO counts from the bottom, so a silent
+#: no-op writes a vertically mirrored plan that looks entirely reasonable and
+#: deploys every operator on the wrong side of the map.
+DISPLAY_ROWS = _DisplayRows()
+
+RowBasis = int | _DisplayRows
+
+
+def tile_to_location(tile: Tile, map_height: RowBasis) -> list[int]:
+    """Inverse of :func:`location_to_tile`.
+
+    ``map_height`` is mandatory. It used to default to "do not convert", which
+    made the mirrored output the easiest thing to produce by accident -- an ATO
+    plan always carries bottom-origin rows, so exporting one without the map
+    height silently flipped it.
+    """
+    if isinstance(map_height, _DisplayRows):
+        return [tile.col, tile.row]
+    return [tile.col, map_height - 1 - tile.row]
 
 
 @dataclass(frozen=True)
@@ -137,6 +164,13 @@ class PlannedAction:
     trigger_cost_change: int | None
     pre_delay: float
     post_delay: float
+    #: Which of the operator's three skills the plan brings, and how the plan
+    #: wants it fired. Carried from ``opers[]`` rather than dropped: which skill
+    #: an operator brought changes what the plan means, so a demonstration
+    #: stripped of it teaches the wrong lesson.
+    skill_index: int = 0
+    skill_usage: int = 0
+    skill_times: int = 1
 
 
 #: The subset of MAA action types ATO's planner has a concept of. ``Output`` is
@@ -165,7 +199,10 @@ def _direction_of(action: CopilotAction) -> Direction | None:
 
 
 def to_plan(
-    doc: CopilotDoc, *, map_height: int | None = None, novelty: NoveltyLog | None = None
+    doc: CopilotDoc,
+    *,
+    map_height: RowBasis = DISPLAY_ROWS,
+    novelty: NoveltyLog | None = None,
 ) -> tuple[PlannedAction, ...]:
     """Translate a copilot document into an ATO plan.
 
@@ -177,6 +214,14 @@ def to_plan(
     ``map_height`` is used for both.
     """
     log = novelty if novelty is not None else NoveltyLog(strict=False)
+    # Skill choice lives on the roster entry, not on the action, so index it up
+    # front and attach it to each step the operator takes.
+    loadout: dict[str, tuple[int, int, int]] = {}
+    for group in doc.groups:
+        for oper in group.opers:
+            loadout[oper.name] = (oper.skill, int(oper.skill_usage), oper.skill_times)
+    for oper in doc.opers:
+        loadout[oper.name] = (oper.skill, int(oper.skill_usage), oper.skill_times)
     out: list[PlannedAction] = []
     for i, action in enumerate(doc.actions):
         kind = _KIND_OF.get(action.type)
@@ -187,9 +232,10 @@ def to_plan(
         if action.location is not None:
             tile = (
                 location_to_display_tile(action.location)
-                if map_height is None
+                if isinstance(map_height, _DisplayRows)
                 else location_to_tile(action.location, map_height)
             )
+        skill_index, skill_usage, skill_times = loadout.get(action.name, (0, 0, 1))
         out.append(
             PlannedAction(
                 kind=kind,
@@ -202,6 +248,9 @@ def to_plan(
                 trigger_cost_change=action.cost_changes or None,
                 pre_delay=action.pre_delay / _MS,
                 post_delay=action.post_delay / _MS,
+                skill_index=skill_index,
+                skill_usage=skill_usage,
+                skill_times=skill_times,
             )
         )
     return tuple(out)
@@ -230,7 +279,7 @@ def from_plan(
     actions: Iterable[PlannedAction],
     stage_name: str,
     *,
-    map_height: int | None = None,
+    map_height: RowBasis,
     title: str = "",
     details: str = "",
     minimum_required: str = "v4.0.0",
@@ -266,15 +315,29 @@ def from_plan(
                 post_delay=round(step.post_delay * _MS),
             )
         )
-    names = tuple(
-        dict.fromkeys(s.char_name for s in plan if s.kind == "deploy" and s.char_name)
-    )
+    # Rebuild the roster from the plan, carrying each operator's skill choice
+    # back out. A round trip that dropped it would quietly rewrite a plan that
+    # depends on someone's second skill into one that brings their first.
+    loadout: dict[str, tuple[int, int, int]] = {}
+    for step in plan:
+        if step.kind == "deploy" and step.char_name:
+            loadout.setdefault(
+                step.char_name, (step.skill_index, step.skill_usage, step.skill_times)
+            )
     return CopilotDoc(
         stage_name=stage_name,
         minimum_required=minimum_required,
         title=title,
         details=details,
-        opers=tuple(CopilotOper(name=n) for n in names),
+        opers=tuple(
+            CopilotOper(
+                name=n,
+                skill=sk,
+                skill_usage=SkillUsage(use) if use in _SKILL_USAGE_VALUES else SkillUsage.NOT_USE,
+                skill_times=times,
+            )
+            for n, (sk, use, times) in loadout.items()
+        ),
         actions=tuple(built),
     )
 

@@ -175,26 +175,40 @@ class Change:
         return list(names)[:limit]
 
 
-def combat_delta(change: Change) -> float:
-    """Largest relative move among an entity's combat leaves.
+def leaf_delta(before: Any, after: Any) -> float:
+    """Relative move of one leaf, saturating at 1.0.
 
     Measured against the *old* value, so a x1.2 buff reads as 20%. A categorical
     flip (``WALK`` -> ``FLY``, a phase appearing) has no relative size but
-    changes everything, so it saturates at 1.0.
+    changes everything, so it counts as total.
     """
+    numeric = (
+        isinstance(before, (int, float))
+        and isinstance(after, (int, float))
+        and not isinstance(before, bool)
+        and not isinstance(after, bool)
+    )
+    if not numeric:
+        return 1.0
+    base = abs(float(before)) or abs(float(after))
+    return min(abs(float(after) - float(before)) / base, 1.0) if base > 0.0 else 0.0
+
+
+def combat_delta(change: Change) -> float:
+    """Largest relative move among an entity's combat leaves.
+
+    Reads the exact figure recorded during the walk rather than re-deriving it
+    from the stored samples. Those samples are capped, and capped in sorted-walk
+    order rather than by size, so an entity with many changed stats would have
+    had its rebalance measured from whichever leaves happened to sort first --
+    reporting a boss whose HP tripled as a rounding change.
+    """
+    exact = change.detail.get("combat_worst")
+    if isinstance(exact, (int, float)):
+        return min(float(exact), 1.0)
     worst = 0.0
     for before, after in change.detail.get("combat", {}).values():
-        numeric = (
-            isinstance(before, (int, float))
-            and isinstance(after, (int, float))
-            and not isinstance(before, bool)
-            and not isinstance(after, bool)
-        )
-        if not numeric:
-            return 1.0
-        base = abs(float(before)) or abs(float(after))
-        if base > 0.0:
-            worst = max(worst, abs(float(after) - float(before)) / base)
+        worst = max(worst, leaf_delta(before, after))
     return min(worst, 1.0)
 
 
@@ -210,6 +224,9 @@ class _Walk:
     paths: list[str] = field(default_factory=list)
     combat: dict[str, list[Any]] = field(default_factory=dict)
     combat_count: int = 0
+    #: Exact largest relative move seen, accumulated over every combat leaf
+    #: rather than over the capped sample set.
+    combat_worst: float = 0.0
     total: int = 0
     nodes: int = 0
     truncated: bool = False
@@ -238,6 +255,10 @@ def _record(w: _Walk, path: str, old: Any, new: Any) -> None:
         w.truncated = True
     if is_combat_path(path, w.entity_type):
         w.combat_count += 1
+        # The magnitude is accumulated for every leaf; only the *samples* are
+        # capped. Deriving the magnitude from the samples instead would make it
+        # depend on which paths happened to sort first.
+        w.combat_worst = max(w.combat_worst, leaf_delta(old, new))
         if len(w.combat) < MAX_COMBAT_SAMPLES:
             w.combat[path] = [_summarise(old), _summarise(new)]
 
@@ -313,6 +334,7 @@ def diff_entity(
     body.update(
         combat=w.combat,
         combat_count=w.combat_count,
+        combat_worst=w.combat_worst,
         paths=w.total,
         truncated=w.truncated,
     )

@@ -178,6 +178,20 @@ class CopilotStats:
     problems: list[tuple[str, str]] = field(default_factory=list)
     max_samples: int = 50
     novelty: NoveltyLog = field(default_factory=lambda: NoveltyLog(strict=False))
+    #: Novelty events carry the file they came from in their context, so they do
+    #: not deduplicate across a corpus and the raw list grows with it. Retain a
+    #: bounded sample and fold the rest into counts, which is what the class
+    #: promises anyway.
+    novelty_counts: Counter[str] = field(default_factory=Counter)
+    max_novelty: int = 200
+
+    def _compact_novelty(self) -> None:
+        events = self.novelty.events
+        if len(events) <= self.max_novelty:
+            return
+        for ev in events[self.max_novelty:]:
+            self.novelty_counts[f"{ev.kind}:{ev.key}"] += 1
+        del events[self.max_novelty:]
 
     def add(self, source: str, doc: CopilotDoc) -> None:
         self.files += 1
@@ -196,6 +210,7 @@ class CopilotStats:
             self.invalid += 1
             if len(self.problems) < self.max_samples:
                 self.problems.append((source, problems[0]))
+        self._compact_novelty()
 
     def add_failure(self, failure: ParseFailure) -> None:
         self.files += 1
