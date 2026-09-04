@@ -330,7 +330,7 @@ def compile_scenario(
     """
     novelty = NoveltyLog(strict=strict)
     want = Difficulty.parse(difficulty)
-    bmap = BattleMap.from_level(level)
+    bmap = BattleMap.from_level(level, novelty)
 
     # Tile kinds are checked here rather than nowhere: the registries existed
     # from the start but nothing ever consulted TILES, so tile novelty recall

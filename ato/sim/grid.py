@@ -5,10 +5,46 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from ato.sim.registry import MechanismKind, NoveltyLog
 from ato.sim.types import MotionMode, Tile
 
 #: ``buildableType`` values as they appear in level JSON.
 BUILD_NONE, BUILD_MELEE, BUILD_RANGED, BUILD_ALL = "NONE", "MELEE", "RANGED", "ALL"
+
+#: A minority of level files serialise the tile enums as integers rather than
+#: names. Parsed as strings they compare equal to nothing, so such a stage yields
+#: no deployable tiles and no walkable tiles -- it is silently unplayable, with
+#: no error anywhere.
+#:
+#: The mappings below were recovered empirically rather than assumed: for every
+#: tile kind appearing in an integer-encoded file, the (height, buildable,
+#: passable) triple was compared against the same tile kind's string encoding
+#: elsewhere in the corpus. All eight kinds agreed. Values marked inferred were
+#: not observed and follow the enum's shape; meeting one produces a NoveltyEvent
+#: rather than a guess.
+_HEIGHT_BY_INT = {0: "LOWLAND", 1: "HIGHLAND"}
+_BUILDABLE_BY_INT = {0: "NONE", 1: "MELEE", 2: "RANGED", 3: "ALL"}  # 3 inferred
+_PASSABLE_BY_INT = {0: "NONE", 1: "WALK", 2: "FLY_ONLY", 3: "ALL"}  # 0,1 inferred
+_SIDE_BY_INT = {0: "NONE", 1: "PLAYER", 2: "ENEMY", 3: "ALL"}       # inferred
+
+
+def _enum(value: object, table: dict[int, str], default: str, field: str,
+          novelty: "NoveltyLog | None" = None) -> str:
+    """Read a tile enum that may arrive as a name or as an integer."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        name = table.get(value)
+        if name is None:
+            if novelty is not None:
+                novelty.report(MechanismKind.TILE, f"{field}={value}",
+                               "integer tile enum outside the recovered mapping")
+            return default
+        return name
+    return str(value)
+
 
 #: Diagonal-inclusive neighbourhood, used when a route allows diagonal movement.
 _NEIGHBOURS_8 = ((0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1))
@@ -68,7 +104,7 @@ class BattleMap:
     # -- construction ----------------------------------------------------
 
     @classmethod
-    def from_level(cls, level: dict[str, Any]) -> BattleMap:
+    def from_level(cls, level: dict[str, Any], novelty: "NoveltyLog | None" = None) -> BattleMap:
         md = level["mapData"]
         grid = md["map"]
         raw_tiles = md["tiles"]
@@ -86,10 +122,14 @@ class BattleMap:
                 line.append(
                     TileInfo(
                         key=t["tileKey"],
-                        height=t["heightType"],
-                        buildable=t["buildableType"],
-                        passable_mask=t["passableMask"],
-                        player_side_mask=t.get("playerSideMask") or "ALL",
+                        height=_enum(t.get("heightType"), _HEIGHT_BY_INT, "LOWLAND",
+                                     "heightType", novelty),
+                        buildable=_enum(t.get("buildableType"), _BUILDABLE_BY_INT, "NONE",
+                                        "buildableType", novelty),
+                        passable_mask=_enum(t.get("passableMask"), _PASSABLE_BY_INT, "NONE",
+                                            "passableMask", novelty),
+                        player_side_mask=_enum(t.get("playerSideMask"), _SIDE_BY_INT, "ALL",
+                                               "playerSideMask", novelty),
                         blackboard=bb,
                     )
                 )

@@ -63,8 +63,15 @@ sim-vs-real 对拍证据，给出 `UNKNOWN / UNTRUSTED / TRIAGE / IMITATION / PL
 - **突袭（stageId 带 `#f#`）与普通关共用同一个 level 文件**，只靠 rune 的 `difficultyMask` 区分。
   1-7 实测：敌人 atk/def/hp ×1.2、生命 +1、回费 ×2。
 - 旧版本 level 文件把枚举存成**整数**（checkpoint / waveAction / motionMode）→ 走 `ato.sim.registry` 归一化。
+- **地格枚举同样有整数编码**（抽样 85 关中 2 关，约 2.4%），且这些文件的 `playerSideMask` 为 `null`。
+  当字符串读会让整关"零可部署格、零可通行格"——静默不可玩，无任何报错。
+  映射经实测反推（对同一 tileKey 在字符串文件中的取值比对，八种地格全部自洽）：
+  `heightType` 0=LOWLAND / 1=HIGHLAND；`buildableType` 0=NONE / 1=MELEE / 2=RANGED；
+  `passableMask` 2=FLY_ONLY / 3=ALL。归一化在 `ato.sim.grid._enum`，映射外的整数产生 novelty。
 - `enemy_database.json` 每个字段包成 `{m_defined, m_value}`，高等级只覆写声明过的字段，其余继承 level 0。
 - `character_table.json` 每个精英阶段只存两个关键帧（1 级与满级），中间等级线性插值。
+- `enemyDbRefs[].overwrittenData` 会覆写敌人数值（实测 113 关中 19% 的引用带覆写、38.9% 的关卡至少一处，
+  最极端一例 BOSS 血量 18,000→80,000）。`useDb:false` 表示该敌人完全由关卡就地定义。走 `resolve_enemy_ref`。
 - 敌人伤害类型在 `enemy_handbook_table.damageType`：`PHYSIC / MAGIC / NO_DAMAGE / HEAL`；
   `enemyLevel` 为 `NORMAL / ELITE / BOSS`。
 - `options.moveMultiplier` 在抽样的 58 个关卡里**恒为 0.5** → 它是全局速度换算系数，不是关卡旋钮。
