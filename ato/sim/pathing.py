@@ -77,13 +77,17 @@ def parse_route(index: int, raw: dict[str, Any], novelty: NoveltyLog) -> RouteSp
     """Normalise one ``level.routes`` entry. Returns ``None`` for placeholder slots."""
     if raw is None:
         return None
-    from ato.sim.registry import motion_mode as _motion
+    from ato.sim.registry import MOTIONS, motion_mode as _motion
 
     mode = _motion(raw.get("motionMode"))
-    if raw.get("motionMode") in (None, "E_NUM") and not raw.get("checkpoints"):
+    if mode in ("E_NUM", "WALK") and not raw.get("checkpoints"):
         # Placeholder slot: the client pads the routes array. Not an error.
         if raw.get("startPosition") == raw.get("endPosition") == {"row": 0, "col": 0}:
             return None
+    if not novelty.check(MOTIONS, mode, f"route {index}"):
+        # An unrecognised motion mode is not a walker by default: guessing here
+        # would put a ground enemy on a path only a flier can take.
+        return None
 
     cps: list[Checkpoint] = []
     for c in raw.get("checkpoints") or ():

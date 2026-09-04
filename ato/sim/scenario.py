@@ -11,17 +11,20 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any
 
-from ato.gamedata.models import EnemySpec, resolve_enemy
+from ato.gamedata.models import EnemySpec, resolve_enemy_ref
 from ato.gamedata.tables import GameData
 from ato.sim.grid import BattleMap
 from ato.sim.pathing import RouteSpec, parse_route
 from ato.sim.registry import (
     RUNES,
+    TILES,
     WAVE_ACTIONS,
     MechanismKind,
     NoveltyLog,
+    wave_action_consistent,
     wave_action_type,
 )
 from ato.sim.types import Direction, Tile
@@ -46,6 +49,36 @@ COSMETIC_ACTIONS = {
 for _a in SPAWNING_ACTIONS | PREDEFINED_ACTIONS:
     WAVE_ACTIONS.register(_a)(lambda *_a2, **_k: None)
 WAVE_ACTIONS.ignore_all(COSMETIC_ACTIONS)
+
+
+#: Tile kinds whose behaviour is fully described by the masks the map already
+#: carries (passable / buildable / height). These are art variants of ground:
+#: a beach tile and a road tile differ only in what they look like.
+#:
+#: Everything NOT listed here produces a NoveltyEvent, which is the point. Tiles
+#: like teleporters, pits, defence-breaking floor and hazard zones carry
+#: mechanics beyond their masks, and a stage built around one of them cannot be
+#: simulated faithfully yet -- so it must be refused rather than approximated.
+COSMETIC_TILES = {
+    "tile_road": "plain ground",
+    "tile_floor": "plain high ground",
+    "tile_wall": "impassable, fully described by its masks",
+    "tile_forbidden": "impassable, fully described by its masks",
+    "tile_empty": "impassable, fully described by its masks",
+    "tile_start": "enemy entrance",
+    "tile_flystart": "flying enemy entrance",
+    "tile_end": "the blue box",
+    "tile_codpsea": "art variant of ground",
+    "tile_football": "art variant of ground",
+    "tile_achand": "art variant of ground",
+    "tile_reed": "art variant of ground",
+    "tile_reedf": "art variant of ground",
+    "tile_ristar_road": "art variant of ground",
+    "tile_ristar_road_forbidden": "art variant of impassable ground",
+    "tile_allygoal": "presentation marker for an ally objective",
+    "tile_enemygoal": "presentation marker, the blue box's masks carry the rule",
+}
+TILES.ignore_all(COSMETIC_TILES)
 
 
 @dataclass(frozen=True)
@@ -120,6 +153,36 @@ class Wave:
     post_delay: float
     max_wait_for_next: float
     fragments: tuple[WaveFragment, ...]
+
+
+#: Bit positions of the client's profession flags. ``professionMask`` selects
+#: which classes a rune applies to, and it is serialised either as this bitmask
+#: or as the flag names -- so parsing it as an integer crashes on the string form.
+PROFESSION_BITS = {
+    "PIONEER": 1, "WARRIOR": 2, "MEDIC": 4, "TANK": 8, "SNIPER": 16,
+    "CASTER": 32, "SUPPORT": 64, "SPECIAL": 128, "TOKEN": 256, "TRAP": 512,
+}
+PROFESSION_ALL = 1023
+
+
+def parse_profession_mask(value: Any) -> int:
+    """Accept either the integer mask or a names form such as ``TRAP`` or ``ALL``."""
+    if value is None:
+        return PROFESSION_ALL
+    if isinstance(value, bool):
+        return PROFESSION_ALL
+    if isinstance(value, int):
+        return value
+    out = 0
+    for part in str(value).replace("|", " ").replace(",", " ").split():
+        key = part.strip().upper()
+        if key == "ALL":
+            out |= PROFESSION_ALL
+        elif key == "NONE":
+            continue
+        else:
+            out |= PROFESSION_BITS.get(key, 0)
+    return out or PROFESSION_ALL
 
 
 class Difficulty(enum.IntFlag):
@@ -221,6 +284,21 @@ class Scenario:
             raise KeyError(f"enemy {key!r} level {level} not in scenario roster")
         return spec
 
+    @cached_property
+    def enemy_by_key(self) -> dict[str, EnemySpec]:
+        """Highest-tier spec per enemy id, for spawn lookup.
+
+        Wave actions name an enemy by id only; the tier comes from the stage's
+        reference list. Precomputed because spawning scanned the whole roster
+        for every enemy that entered the field.
+        """
+        out: dict[str, EnemySpec] = {}
+        for (key, _lv), spec in self.enemy_specs.items():
+            cur = out.get(key)
+            if cur is None or spec.level > cur.level:
+                out[key] = spec
+        return out
+
 
 def _blackboard(entries: Any) -> tuple[dict[str, float], dict[str, str]]:
     nums: dict[str, float] = {}
@@ -254,6 +332,12 @@ def compile_scenario(
     want = Difficulty.parse(difficulty)
     bmap = BattleMap.from_level(level)
 
+    # Tile kinds are checked here rather than nowhere: the registries existed
+    # from the start but nothing ever consulted TILES, so tile novelty recall
+    # was zero and a stage built on teleporters looked as ordinary as 1-7.
+    for key in sorted({bmap[t].key for t in bmap.all_tiles()}):
+        novelty.check(TILES, key, f"level {level_id}")
+
     routes: dict[int, RouteSpec] = {}
     for i, raw in enumerate(level.get("routes") or ()):
         r = parse_route(i, raw, novelty)
@@ -279,6 +363,17 @@ def compile_scenario(
                     continue
                 kind = wave_action_type(a.get("actionType"))
                 if not novelty.check(WAVE_ACTIONS, kind, f"level {level_id}"):
+                    continue
+                if not wave_action_consistent(kind, a.get("key") or ""):
+                    # The decode disagrees with the key it carries. On an
+                    # integer-serialised file that means the enum ordering we
+                    # inferred is wrong for this entry, and acting on it would
+                    # spawn something the stage never spawns.
+                    novelty.report(
+                        MechanismKind.WAVE_ACTION,
+                        f"{kind}<-{a.get('actionType')!r}",
+                        f"{level_id}: decoded type does not match key {a.get('key')!r}",
+                    )
                     continue
                 acts.append(
                     WaveAction(
@@ -326,28 +421,40 @@ def compile_scenario(
                 difficulty_mask=mask,
                 blackboard=nums,
                 value_str=strs,
-                profession_mask=int(r.get("professionMask") or 1023),
+                profession_mask=parse_profession_mask(r.get("professionMask")),
                 buildable_mask=str(r.get("buildableMask") or "ALL"),
             )
         )
 
     # -- enemy roster -----------------------------------------------------
-    refs: dict[str, int] = {}
-    for ref in level.get("enemyDbRefs") or ():
-        if ref and ref.get("id"):
-            refs[ref["id"]] = max(refs.get(ref["id"], 0), int(ref.get("level") or 0))
+    #
+    # A stage may reshape an enemy for its own purposes through
+    # ``overwrittenData``, or define one outright with ``useDb: false``.
+    # Resolving from the database alone silently simulates a different enemy
+    # than the stage spawns.
     specs: dict[tuple[str, int], EnemySpec] = {}
-    for enemy_id in refs:
-        levels = gd.enemies.get(enemy_id)
-        if levels is None:
-            novelty.report(
-                MechanismKind.ENEMY_ABILITY, enemy_id, "enemy id absent from enemy_database"
-            )
+    for ref in level.get("enemyDbRefs") or ():
+        if not ref or not ref.get("id"):
             continue
-        for ref in level.get("enemyDbRefs") or ():
-            if ref and ref.get("id") == enemy_id:
-                lv = int(ref.get("level") or 0)
-                specs[(enemy_id, lv)] = resolve_enemy(levels, lv)
+        enemy_id = str(ref["id"])
+        lv = int(ref.get("level") or 0)
+        overwritten = ref.get("overwrittenData")
+        use_db = bool(ref.get("useDb", True))
+        levels = gd.enemies.get(enemy_id)
+        try:
+            spec = resolve_enemy_ref(
+                levels, lv, overwritten,
+                use_db=use_db and levels is not None,
+                enemy_id=enemy_id,
+            )
+        except (KeyError, ValueError) as exc:
+            novelty.report(MechanismKind.ENEMY_ABILITY, enemy_id, str(exc))
+            continue
+        # Keep the highest level when a stage references one enemy twice; the
+        # wave action names only the id, so the tougher tier is the safe read.
+        prev = specs.get((enemy_id, lv))
+        if prev is None or spec.level >= prev.level:
+            specs[(enemy_id, lv)] = spec
 
     # -- predefined units --------------------------------------------------
     pre: list[PredefinedUnit] = []

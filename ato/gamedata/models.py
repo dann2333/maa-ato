@@ -29,6 +29,12 @@ _BOOL_ATTRS = (
     "teleportImmune", "groundBoundImmune",
 )
 
+#: Almost no enemy declares ``blockCnt``, so the implicit default decides how
+#: many enemies a defender actually holds -- one of the highest-leverage unknowns
+#: in the simulator. Registered as a calibration item in docs/SIM_SPEC.md rather
+#: than buried as a literal.
+DEFAULT_ENEMY_BLOCK_CNT = 1
+
 
 @dataclass
 class Stats:
@@ -102,8 +108,10 @@ class EnemySpec:
         return self.motion.upper() == "FLY"
 
 
-def resolve_enemy(levels: list[dict[str, Any]], level: int) -> EnemySpec:
-    """Collapse ``enemy_database`` level entries down to a single spec.
+def _merge_enemy_levels(
+    levels: list[dict[str, Any]], level: int
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """Collapse the level chain into ``(fields, attributes, effective level)``.
 
     Levels above the highest defined one clamp, matching the game's behaviour of
     reusing the top-most defined tier.
@@ -112,7 +120,6 @@ def resolve_enemy(levels: list[dict[str, Any]], level: int) -> EnemySpec:
         raise ValueError("enemy has no level entries")
     ordered = sorted(levels, key=lambda e: e["level"])
     target = min(level, ordered[-1]["level"])
-
     merged: dict[str, Any] = {}
     attrs: dict[str, Any] = {}
     for entry in ordered:
@@ -121,15 +128,19 @@ def resolve_enemy(levels: list[dict[str, Any]], level: int) -> EnemySpec:
         data = entry["enemyData"]
         merged = _merge_defined(merged, {k: v for k, v in data.items() if k != "attributes"})
         attrs = _merge_defined(attrs, data.get("attributes") or {})
+    return merged, attrs, target
 
+
+def _stats_from(attrs: dict[str, Any]) -> Stats:
     immunities = frozenset(k for k in _BOOL_ATTRS if attrs.get(k))
-    stats = Stats(
+    return Stats(
         max_hp=float(attrs.get("maxHp") or 0),
         atk=float(attrs.get("atk") or 0),
         defense=float(attrs.get("def") or 0),
         res=float(attrs.get("magicResistance") or 0),
         cost=int(attrs.get("cost") or 0),
-        block_cnt=int(attrs.get("blockCnt") or 0),
+        block_cnt=int(attrs.get("blockCnt") if attrs.get("blockCnt") is not None
+                      else DEFAULT_ENEMY_BLOCK_CNT),
         move_speed=float(attrs.get("moveSpeed") or 1.0),
         attack_speed=float(attrs.get("attackSpeed") or 100.0),
         base_attack_time=float(attrs.get("baseAttackTime") or 1.0),
@@ -141,12 +152,15 @@ def resolve_enemy(levels: list[dict[str, Any]], level: int) -> EnemySpec:
         mass_level=int(attrs.get("massLevel") or 0),
         immunities=immunities,
     )
-    name = merged.get("name") or ""
+
+
+def _spec_from(merged: dict[str, Any], attrs: dict[str, Any], level: int,
+               fallback_key: str = "") -> EnemySpec:
     return EnemySpec(
-        key=merged.get("prefabKey") or "",
-        level=target,
-        name=name,
-        stats=stats,
+        key=merged.get("prefabKey") or fallback_key,
+        level=level,
+        name=merged.get("name") or "",
+        stats=_stats_from(attrs),
         apply_way=(merged.get("applyWay") or "MELEE"),
         motion=(merged.get("motion") or "WALK"),
         life_point_reduce=int(merged.get("lifePointReduce") or 1),
@@ -156,6 +170,46 @@ def resolve_enemy(levels: list[dict[str, Any]], level: int) -> EnemySpec:
         talent_blackboard=tuple(merged.get("talentBlackboard") or ()),
         raw={**merged, "attributes": attrs},
     )
+
+
+def resolve_enemy(levels: list[dict[str, Any]], level: int) -> EnemySpec:
+    """Collapse ``enemy_database`` level entries down to a single spec."""
+    merged, attrs, target = _merge_enemy_levels(levels, level)
+    return _spec_from(merged, attrs, target)
+
+
+def resolve_enemy_ref(
+    levels: list[dict[str, Any]] | None,
+    level: int,
+    overwritten: dict[str, Any] | None = None,
+    *,
+    use_db: bool = True,
+    enemy_id: str = "",
+) -> EnemySpec:
+    """Resolve one ``level.enemyDbRefs`` entry, honouring the level's overrides.
+
+    A stage may reshape an enemy for its own purposes, and a meaningful minority
+    of references do: the ``overwrittenData`` block is a partial ``enemyData`` in
+    the same ``{m_defined, m_value}`` form, layered on top of the database entry.
+    Ignoring it -- which this code did until it was measured -- silently
+    simulates a different enemy than the stage actually spawns, and the error is
+    invisible because the result still looks like a plausible battle.
+
+    ``use_db=False`` means the stage defines the enemy outright and the database
+    is not consulted at all.
+    """
+    if use_db and levels:
+        merged, attrs, target = _merge_enemy_levels(levels, level)
+    elif not use_db and overwritten:
+        merged, attrs, target = {}, {}, level
+    else:
+        raise KeyError(f"enemy {enemy_id!r} not in enemy_database and no inline definition")
+
+    if overwritten:
+        merged = _merge_defined(merged, {k: v for k, v in overwritten.items()
+                                         if k != "attributes"})
+        attrs = _merge_defined(attrs, overwritten.get("attributes") or {})
+    return _spec_from(merged, attrs, target, fallback_key=enemy_id)
 
 
 # ---------------------------------------------------------------------------

@@ -124,10 +124,14 @@ class NoveltyLog:
 # ---------------------------------------------------------------------------
 
 TILES = Registry(MechanismKind.TILE)
+MOTIONS = Registry(MechanismKind.TRAIT)
 RUNES = Registry(MechanismKind.RUNE)
 CHECKPOINTS = Registry(MechanismKind.CHECKPOINT)
 WAVE_ACTIONS = Registry(MechanismKind.WAVE_ACTION)
 SKILL_KEYS = Registry(MechanismKind.SKILL_KEY)
+
+for _m in ("WALK", "FLY"):
+    MOTIONS.register(_m)(lambda *_a, **_k: None)
 
 ALL_REGISTRIES = {
     MechanismKind.TILE: TILES,
@@ -190,5 +194,37 @@ def wave_action_type(value: Any) -> str:
 
 
 def motion_mode(value: Any) -> str:
-    v = _norm(value, _MOTION_ORDER)
-    return "WALK" if v in ("E_NUM", "UNKNOWN_-1") else v
+    """Normalise a motion mode without inventing one.
+
+    ``E_NUM`` is the client's placeholder on unused route slots; it is returned
+    as-is so the route parser can tell a placeholder from a route it failed to
+    understand. Silently reading either as WALK would put ground enemies on a
+    flier's path and look entirely plausible while doing it.
+    """
+    return _norm(value, _MOTION_ORDER)
+
+
+#: What each wave action's ``key`` field looks like when the decode is right.
+#: Older level files store ``actionType`` as an integer, and the ordering used to
+#: decode those integers was inferred, not confirmed. Rather than trusting the
+#: guess, every decode is cross-checked against the shape of the key it carries:
+#: a SPAWN names an enemy, a predefined-unit action names a trap instance, a
+#: story beat names an asset path. A decode that contradicts its own key is
+#: reported as novelty instead of quietly spawning the wrong thing.
+_ACTION_KEY_SHAPE: dict[str, Callable[[str], bool]] = {
+    "SPAWN": lambda k: k.startswith("enemy_") or k.startswith("trap_"),
+    "PREVIEW_CURSOR": lambda k: k.startswith("enemy_") or k in ("", "default"),
+    "DISPLAY_ENEMY_INFO": lambda k: k.startswith("enemy_") or k == "",
+    "ACTIVATE_PREDEFINED": lambda k: "#" in k or k.startswith("trap") or k == "",
+    "TRIGGER_PREDEFINED": lambda k: "#" in k or k.startswith("trap") or k == "",
+    "WITHDRAW_PREDEFINED": lambda k: "#" in k or k.startswith("trap") or k == "",
+    "STORY": lambda k: "/" in k or k == "",
+    "PLAY_OPERA": lambda k: "/" in k or k == "",
+    "TUTORIAL": lambda k: True,
+}
+
+
+def wave_action_consistent(kind: str, key: str) -> bool:
+    """Whether a decoded action type agrees with the shape of its key."""
+    shape = _ACTION_KEY_SHAPE.get(kind)
+    return True if shape is None else shape(str(key or ""))

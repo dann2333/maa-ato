@@ -532,10 +532,7 @@ class BattleEngine:
                 f"{self.sc.level_id}: spawn references a missing route",
             )
             return
-        spec = None
-        for (key, lvl), candidate in self.sc.enemy_specs.items():
-            if key == act.key:
-                spec = candidate if spec is None or lvl > spec.level else spec
+        spec = self.sc.enemy_by_key.get(act.key)
         if spec is None:
             self.novelty.report(MechanismKind.ENEMY_ABILITY, act.key,
                                 f"{self.sc.level_id}: enemy not in scenario roster")
