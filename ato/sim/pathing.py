@@ -217,3 +217,91 @@ def route_waypoints(
         for t in seg:
             pts.append(t.xy)
     return tuple(pts)
+
+
+# ---------------------------------------------------------------------------
+# Route programs
+# ---------------------------------------------------------------------------
+#
+# ``route_waypoints`` flattens a route to pure geometry, which loses the timing
+# checkpoints. A *program* keeps them: an enemy executes an ordered list of
+# steps, so a WAIT_FOR_SECONDS between two MOVEs stops the unit at the right
+# place for the right duration instead of being silently dropped.
+
+
+@dataclass(frozen=True, slots=True)
+class MoveStep:
+    """Walk through these points in order."""
+
+    points: tuple[Vec2, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WaitStep:
+    """Hold position. ``seconds < 0`` means "until the engine releases us"
+    (used by the wave-relative waits, which the engine resolves)."""
+
+    seconds: float
+    kind: str = "WAIT_FOR_SECONDS"
+
+
+@dataclass(frozen=True, slots=True)
+class TeleportStep:
+    """Reappear at a position without traversing the tiles in between."""
+
+    position: Vec2
+
+
+@dataclass(frozen=True, slots=True)
+class DisappearStep:
+    """Leave the field; the unit is untargetable until its next step."""
+
+
+RouteStep = MoveStep | WaitStep | TeleportStep | DisappearStep
+
+
+def build_route_program(
+    bmap: BattleMap,
+    route: RouteSpec,
+    *,
+    blocked: frozenset[Tile] = frozenset(),
+) -> tuple[RouteStep, ...]:
+    """Expand a route into the ordered steps a unit executes.
+
+    Movement between two positions follows the tile graph for walkers and a
+    straight line for fliers, matching the client.
+    """
+    steps: list[RouteStep] = []
+    cursor = route.start
+
+    def move_to(dst: Tile) -> None:
+        nonlocal cursor
+        if dst == cursor:
+            return
+        if route.motion is MotionMode.FLY:
+            pts = (dst.xy,)
+        else:
+            path = shortest_path(
+                bmap, cursor, dst, route.motion, diagonal=route.allow_diagonal, blocked=blocked
+            )
+            # A route the map does not connect is a data/mechanic problem, not a
+            # reason to crash: fall back to the direct hop and let the caller's
+            # calibration checks notice the divergence.
+            pts = tuple(t.xy for t in path[1:]) if path else (dst.xy,)
+        if pts:
+            steps.append(MoveStep(pts))
+        cursor = dst
+
+    for cp in route.checkpoints:
+        if cp.is_move:
+            move_to(cp.position)
+        elif cp.is_wait:
+            steps.append(WaitStep(cp.time, cp.kind))
+        elif cp.kind == "APPEAR_AT_POS":
+            steps.append(TeleportStep(cp.position.xy + cp.reach_offset))
+            cursor = cp.position
+        elif cp.kind == "DISAPPEAR":
+            steps.append(DisappearStep())
+
+    move_to(route.end)
+    return tuple(steps)
