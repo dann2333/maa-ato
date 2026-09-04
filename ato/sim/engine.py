@@ -17,6 +17,7 @@ that may be wrong (INVARIANT I-5).
 
 from __future__ import annotations
 
+import copy
 import random
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -604,14 +605,26 @@ class BattleEngine:
         self._detach(e)
 
     def _assign_blocks(self) -> None:
-        for op in self.state.deployed:
-            if op.state is not UnitState.ACTIVE or op.block_free <= 0:
+        """Hand each unblocked ground enemy to the operator standing on its tile.
+
+        Indexed by tile rather than compared pairwise: the naive
+        operators-x-enemies scan was the engine's dominant cost, and blocking is
+        decided purely by tile identity anyway.
+        """
+        free: dict[Tile, OperatorUnit] = {}
+        for op in self.state.operators:
+            if op.state is UnitState.ACTIVE and op.block_free > 0:
+                free[op.tile] = op
+        if not free:
+            return
+        for e in self.state.enemies:
+            if e.state is not UnitState.ACTIVE or e.blocked_by is not None or e.is_flying:
                 continue
-            for e in self.state.enemies:
-                if op.block_free <= 0:
-                    break
-                if e.targetable and not e.blocked and not e.is_flying and e.position.tile == op.tile:
-                    try_block(op, e)
+            op = free.get(e.position.tile)
+            if op is not None and try_block(op, e) and op.block_free <= 0:
+                free.pop(op.tile, None)
+                if not free:
+                    return
 
     def _charge_sp(self, now: float) -> None:
         for op in self.state.deployed:
@@ -661,21 +674,38 @@ class BattleEngine:
     # -- attacking --------------------------------------------------------
 
     def _act_operators(self, now: float) -> None:
-        for op in self.state.deployed:
+        """Let every ready operator take its attack.
+
+        Enemies are bucketed by tile once per tick so an operator only looks at
+        the tiles its range actually covers, instead of filtering the whole
+        enemy list per operator.
+        """
+        deployed = self.state.deployed
+        if not deployed:
+            return
+        occupancy: dict[Tile, list[EnemyUnit]] = {}
+        for e in self.state.enemies:
+            if e.state is UnitState.ACTIVE:
+                occupancy.setdefault(e.position.tile, []).append(e)
+
+        for op in deployed:
             if op.state is not UnitState.ACTIVE or not op.stats.can_act:
                 continue
-            covered = set(op.covered_tiles())
             seen = self._in_range_since.setdefault(op.uid, {})
             in_range: list[EnemyUnit] = []
-            for e in self.state.enemies:
-                if not e.targetable:
-                    seen.pop(e.uid, None)
-                    continue
-                if e.position.tile in covered:
+            for t in op.covered_tiles():
+                bucket = occupancy.get(t)
+                if bucket:
+                    in_range.extend(bucket)
+            if in_range:
+                fresh = {e.uid for e in in_range}
+                for e in in_range:
                     seen.setdefault(e.uid, now)
-                    in_range.append(e)
-                else:
-                    seen.pop(e.uid, None)
+                if len(seen) > len(fresh):
+                    for uid in [u for u in seen if u not in fresh]:
+                        del seen[uid]
+            elif seen:
+                seen.clear()
             if now < op.next_attack_at or not in_range:
                 continue
             target = self._pick_operator_target(op, in_range, seen)
@@ -792,6 +822,28 @@ class BattleEngine:
         if now >= self.max_seconds:
             st.result = BattleResult.TIMEOUT
         return st.result
+
+    # -- branching --------------------------------------------------------
+
+    def clone(self) -> BattleEngine:
+        """A deep copy of the mutable battle state, sharing the immutable inputs.
+
+        Search needs to try an action, look ahead, and roll back. Copying the
+        whole object would drag the 90 MB game-data snapshot and the compiled
+        scenario along with it, so both are pinned in the memo and shared. Route
+        programs are frozen dataclasses and are shared for the same reason.
+
+        Correctness rests on those three genuinely being immutable during a
+        battle: the engine only ever reads them.
+        """
+        memo: dict[int, object] = {
+            id(self.gd): self.gd,
+            id(self.sc): self.sc,
+            id(self.cal): self.cal,
+        }
+        for prog in self._programs.values():
+            memo[id(prog)] = prog
+        return copy.deepcopy(self, memo)
 
     # -- introspection ----------------------------------------------------
 

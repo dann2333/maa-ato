@@ -217,6 +217,15 @@ class StatBlock:
 
     def __getattr__(self, name: str) -> float:
         # Only reached for names not in __slots__, i.e. the resolved stats.
+        #
+        # The underscore guard is load-bearing, not defensive style: copy and
+        # pickle probe a half-built object for dunders such as __setstate__
+        # before its slots exist. Without the guard that probe reaches
+        # ``self._dirty``, which is itself missing, and __getattr__ recurses
+        # until the stack dies -- with a traceback that points at this line
+        # rather than at the copy that caused it.
+        if name.startswith("_"):
+            raise AttributeError(name)
         if self._dirty:
             self._rebuild()
         try:
@@ -231,7 +240,13 @@ class StatBlock:
 
     @property
     def block_capacity(self) -> int:
-        return int(self.block_cnt)
+        # Read the cache directly. This is the hottest stat in the engine --
+        # blocking is checked for every operator/enemy pair on every tick -- and
+        # routing it through __getattr__ showed up as the single largest cost in
+        # a profile of a full battle.
+        if self._dirty:
+            self._rebuild()
+        return int(self._cache["block_cnt"])
 
 
 @dataclass(slots=True)
