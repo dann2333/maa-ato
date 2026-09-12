@@ -13,7 +13,7 @@ import enum
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from ato.gamedata.models import Stats
+from ato.gamedata.models import ATTACK_SPEED_BOUNDS, Stats
 from ato.sim.types import DamageType
 
 #: A hit always lands for at least this fraction of the attacker's ATK, no
@@ -22,7 +22,9 @@ MIN_DAMAGE_RATIO = 0.05
 
 #: Effective attack speed is floored: buffs cannot drive the interval to zero
 #: and slows cannot stop a unit outright.
-MIN_ATTACK_SPEED = 10.0
+#: Default clamp on effective attack speed; the engine overrides it per
+#: StatBlock from calibration. Both ends are unverified -- see SIM_SPEC B-13.
+MIN_ATTACK_SPEED, MAX_ATTACK_SPEED = ATTACK_SPEED_BOUNDS
 
 #: RES is a percentage; it is clamped before use so that an over-shred does not
 #: turn arts damage into healing.
@@ -120,10 +122,13 @@ class Status:
 class StatBlock:
     """Base stats plus the modifiers and statuses currently acting on a unit."""
 
-    __slots__ = ("base", "_mods", "_status", "_cache", "_dirty")
+    __slots__ = ("base", "aspd_bounds", "_mods", "_status", "_cache", "_dirty")
 
-    def __init__(self, base: Stats) -> None:
+    def __init__(
+        self, base: Stats, aspd_bounds: tuple[float, float] = ATTACK_SPEED_BOUNDS
+    ) -> None:
         self.base = base
+        self.aspd_bounds = aspd_bounds
         self._mods: list[Modifier] = []
         self._status: dict[StatusKind, Status] = {}
         self._cache: dict[str, float] = {}
@@ -206,7 +211,10 @@ class StatBlock:
             "defense": max(self._resolve("defense", b.defense), 0.0),
             "res": min(max(self._resolve("res", b.res), MIN_RES), MAX_RES),
             "max_hp": max(self._resolve("max_hp", b.max_hp), 1.0),
-            "attack_speed": max(self._resolve("attack_speed", b.attack_speed), MIN_ATTACK_SPEED),
+            "attack_speed": min(
+                max(self._resolve("attack_speed", b.attack_speed), self.aspd_bounds[0]),
+                self.aspd_bounds[1],
+            ),
             "move_speed": max(self._resolve("move_speed", b.move_speed), 0.0),
             "block_cnt": max(self._resolve("block_cnt", float(b.block_cnt)), 0.0),
             "taunt_level": self._resolve("taunt_level", float(b.taunt_level)),

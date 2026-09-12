@@ -8,8 +8,10 @@ import pytest
 from conftest import make_flier_levels
 
 from ato.gamedata.models import (
+    ATTACK_SPEED_BOUNDS,
     AttackRange,
     Stats,
+    field_or,
     _lerp_frames,
     resolve_enemy,
     resolve_operator,
@@ -29,15 +31,42 @@ from ato.sim.types import Direction
         (100.0, 2.0),      # nominal
         (200.0, 1.0),      # twice as fast
         (50.0, 4.0),       # half as fast
-        (10.0, 20.0),      # exactly on the floor
-        (5.0, 20.0),       # below the floor: clamped, not extrapolated
-        (0.0, 20.0),       # a total slow must not divide by zero
-        (-100.0, 20.0),
+        (20.0, 10.0),      # exactly on the floor
+        (5.0, 10.0),       # below the floor: clamped, not extrapolated
+        (0.0, 10.0),       # a total slow must not divide by zero
+        (-100.0, 10.0),
+        (600.0, 1.0 / 3),  # exactly on the ceiling
+        (2000.0, 1.0 / 3),  # above it: clamped. Unbounded, this was 0.05 s.
     ],
 )
 def test_attack_interval_scales_with_attack_speed(aspd: float, expected: float) -> None:
     stats = Stats(base_attack_time=2.0, attack_speed=aspd)
     assert stats.attack_interval == pytest.approx(expected)
+
+
+def test_attack_interval_bounds_are_caller_supplied() -> None:
+    """The clamp is a calibration constant, so the simulator must be able to move it.
+
+    The floor is disputed between sources (10 vs 20) and neither reads it out of
+    the client, so nothing may hard-code one of them.
+    """
+    stats = Stats(base_attack_time=2.0, attack_speed=15.0)
+    assert stats.attack_interval_within(10.0, 600.0) == pytest.approx(2.0 * 100 / 15)
+    assert stats.attack_interval_within(20.0, 600.0) == pytest.approx(10.0)
+    assert stats.attack_interval == stats.attack_interval_within(*ATTACK_SPEED_BOUNDS)
+
+
+def test_zero_valued_fields_survive_parsing() -> None:
+    """``or`` cannot tell ``0`` from a missing field, and both occur in this data.
+
+    A stationary enemy (``moveSpeed: 0``) that inherits the 1.0 default walks to
+    the blue box; a skill with ``spRecoveryPerSec: 0`` that inherits 1.0 charges
+    itself. Neither raises anything, which is exactly why it needs a test.
+    """
+    assert field_or({"moveSpeed": 0.0}, "moveSpeed", 1.0) == 0.0
+    assert field_or({"moveSpeed": None}, "moveSpeed", 1.0) == 1.0
+    assert field_or({}, "moveSpeed", 1.0) == 1.0
+    assert field_or({"applyWay": ""}, "applyWay", "MELEE") == ""
 
 
 # ---------------------------------------------------------------------------

@@ -35,6 +35,12 @@ _BOOL_ATTRS = (
 #: than buried as a literal.
 DEFAULT_ENEMY_BLOCK_CNT = 1
 
+#: Clamp on effective attack speed, in percent. Community sources disagree on
+#: the floor (10 vs 20) and none of them reads it out of the binary, so both
+#: ends are calibration parameters the simulator may override; the missing
+#: ceiling is what let a buffed unit reach a 0.05 s attack interval. SIM_SPEC B-13.
+ATTACK_SPEED_BOUNDS = (20.0, 600.0)
+
 
 @dataclass
 class Stats:
@@ -57,15 +63,20 @@ class Stats:
     mass_level: int = 0
     immunities: frozenset[str] = frozenset()
 
-    @property
-    def attack_interval(self) -> float:
-        """Seconds between attacks after attack-speed scaling.
+    def attack_interval_within(self, low: float, high: float) -> float:
+        """Seconds between attacks after attack-speed scaling, clamped to ``[low, high]``.
 
         Arknights scales the interval by ``100 / attackSpeed`` where attackSpeed
-        is a percentage; the result is then quantised to a frame by the engine.
+        is a percentage. The engine clamps that percentage at both ends; the
+        bounds are calibration constants, so the simulator passes its own rather
+        than letting this module decide (see ``EngineCalibration.aspd_min``).
         """
-        aspd = max(self.attack_speed, 10.0)  # the game floors effective aspd at 10%
-        return self.base_attack_time * 100.0 / aspd
+        return self.base_attack_time * 100.0 / min(max(self.attack_speed, low), high)
+
+    @property
+    def attack_interval(self) -> float:
+        """The interval under the default bounds. Prefer :meth:`attack_interval_within`."""
+        return self.attack_interval_within(*ATTACK_SPEED_BOUNDS)
 
 
 def _unwrap(node: Any) -> Any:
@@ -131,6 +142,19 @@ def _merge_enemy_levels(
     return merged, attrs, target
 
 
+def field_or(node: dict[str, Any], key: str, default: Any) -> Any:
+    """``node[key]`` unless it is absent or null — deliberately not ``or``.
+
+    Zero is a real value in this data and ``or`` cannot tell it from a missing
+    field. ``moveSpeed: 0`` marks an enemy that never moves, and ``or 1.0``
+    sent it walking to the blue box; ``spRecoveryPerSec: 0`` marks a skill that
+    never charges on its own, and ``or 1.0`` charged it anyway. Neither error
+    raises anything — the battle just is not the one the game would play.
+    """
+    value = node.get(key)
+    return default if value is None else value
+
+
 def _stats_from(attrs: dict[str, Any]) -> Stats:
     immunities = frozenset(k for k in _BOOL_ATTRS if attrs.get(k))
     return Stats(
@@ -139,15 +163,14 @@ def _stats_from(attrs: dict[str, Any]) -> Stats:
         defense=float(attrs.get("def") or 0),
         res=float(attrs.get("magicResistance") or 0),
         cost=int(attrs.get("cost") or 0),
-        block_cnt=int(attrs.get("blockCnt") if attrs.get("blockCnt") is not None
-                      else DEFAULT_ENEMY_BLOCK_CNT),
-        move_speed=float(attrs.get("moveSpeed") or 1.0),
-        attack_speed=float(attrs.get("attackSpeed") or 100.0),
-        base_attack_time=float(attrs.get("baseAttackTime") or 1.0),
+        block_cnt=int(field_or(attrs, "blockCnt", DEFAULT_ENEMY_BLOCK_CNT)),
+        move_speed=float(field_or(attrs, "moveSpeed", 1.0)),
+        attack_speed=float(field_or(attrs, "attackSpeed", 100.0)),
+        base_attack_time=float(field_or(attrs, "baseAttackTime", 1.0)),
         respawn_time=float(attrs.get("respawnTime") or 0),
         hp_recovery_per_sec=float(attrs.get("hpRecoveryPerSec") or 0.0),
         sp_recovery_per_sec=float(attrs.get("spRecoveryPerSec") or 0.0),
-        max_deploy_count=int(attrs.get("maxDeployCount") or 1),
+        max_deploy_count=int(field_or(attrs, "maxDeployCount", 1)),
         taunt_level=int(attrs.get("tauntLevel") or 0),
         mass_level=int(attrs.get("massLevel") or 0),
         immunities=immunities,
@@ -161,9 +184,9 @@ def _spec_from(merged: dict[str, Any], attrs: dict[str, Any], level: int,
         level=level,
         name=merged.get("name") or "",
         stats=_stats_from(attrs),
-        apply_way=(merged.get("applyWay") or "MELEE"),
-        motion=(merged.get("motion") or "WALK"),
-        life_point_reduce=int(merged.get("lifePointReduce") or 1),
+        apply_way=str(field_or(merged, "applyWay", "MELEE")),
+        motion=str(field_or(merged, "motion", "WALK")),
+        life_point_reduce=int(field_or(merged, "lifePointReduce", 1)),
         tags=tuple(merged.get("enemyTags") or ()),
         range_radius=float(merged.get("rangeRadius") or 0.0),
         skills=tuple(merged.get("skills") or ()),
@@ -327,13 +350,13 @@ def resolve_operator(
         res=float(data.get("magicResistance") or 0),
         cost=int(data.get("cost") or 0),
         block_cnt=int(data.get("blockCnt") or 0),
-        move_speed=float(data.get("moveSpeed") or 1.0),
-        attack_speed=float(data.get("attackSpeed") or 100.0),
-        base_attack_time=float(data.get("baseAttackTime") or 1.0),
+        move_speed=float(field_or(data, "moveSpeed", 1.0)),
+        attack_speed=float(field_or(data, "attackSpeed", 100.0)),
+        base_attack_time=float(field_or(data, "baseAttackTime", 1.0)),
         respawn_time=float(data.get("respawnTime") or 0),
         hp_recovery_per_sec=float(data.get("hpRecoveryPerSec") or 0.0),
-        sp_recovery_per_sec=float(data.get("spRecoveryPerSec") or 1.0),
-        max_deploy_count=int(data.get("maxDeployCount") or 1),
+        sp_recovery_per_sec=float(field_or(data, "spRecoveryPerSec", 1.0)),
+        max_deploy_count=int(field_or(data, "maxDeployCount", 1)),
         taunt_level=int(data.get("tauntLevel") or 0),
         mass_level=int(data.get("massLevel") or 0),
         immunities=immunities,
@@ -394,13 +417,13 @@ def resolve_skill(skill_id: str, skill: dict[str, Any], mastery: int = 6) -> Ski
         skill_id=skill_id,
         name=lv.get("name") or skill_id,
         level=idx,
-        sp_type=str(sp.get("spType") or "INCREASE_WITH_TIME"),
+        sp_type=str(field_or(sp, "spType", "INCREASE_WITH_TIME")),
         sp_cost=float(sp.get("spCost") or 0),
         init_sp=float(sp.get("initSp") or 0),
-        increment=float(sp.get("increment") or 1.0),
+        increment=float(field_or(sp, "increment", 1.0)),
         duration=float(lv.get("duration") or 0.0),
-        duration_type=str(lv.get("durationType") or "NONE"),
-        skill_type=str(lv.get("skillType") or "MANUAL"),
+        duration_type=str(field_or(lv, "durationType", "NONE")),
+        skill_type=str(field_or(lv, "skillType", "MANUAL")),
         range_id=lv.get("rangeId"),
         blackboard=bb,
         description=lv.get("description") or "",

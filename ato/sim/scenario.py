@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any
 
-from ato.gamedata.models import EnemySpec, resolve_enemy_ref
+from ato.gamedata.models import EnemySpec, field_or, resolve_enemy_ref
 from ato.gamedata.tables import GameData
 from ato.sim.grid import BattleMap
 from ato.sim.pathing import RouteSpec, parse_route
@@ -99,15 +99,15 @@ class BattleOptions:
     def from_level(cls, level: dict[str, Any]) -> BattleOptions:
         o = level.get("options") or {}
         return cls(
-            character_limit=int(o.get("characterLimit") or 8),
-            max_life_point=int(o.get("maxLifePoint") or 3),
-            initial_cost=int(o.get("initialCost") or 10),
-            max_cost=int(o.get("maxCost") or 99),
-            cost_increase_time=float(o.get("costIncreaseTime") or 1.0),
-            move_multiplier=float(o.get("moveMultiplier") or 1.0),
+            character_limit=int(field_or(o, "characterLimit", 8)),
+            max_life_point=int(field_or(o, "maxLifePoint", 3)),
+            initial_cost=int(field_or(o, "initialCost", 10)),
+            max_cost=int(field_or(o, "maxCost", 99)),
+            cost_increase_time=float(field_or(o, "costIncreaseTime", 1.0)),
+            move_multiplier=float(field_or(o, "moveMultiplier", 0.5)),
             steering_enabled=bool(o.get("steeringEnabled", True)),
-            max_play_time=float(o.get("maxPlayTime") if o.get("maxPlayTime") is not None else -1.0),
-            function_disable_mask=str(o.get("functionDisableMask") or "NONE"),
+            max_play_time=float(field_or(o, "maxPlayTime", -1.0)),
+            function_disable_mask=str(field_or(o, "functionDisableMask", "NONE")),
         )
 
 
@@ -379,9 +379,9 @@ def compile_scenario(
                     WaveAction(
                         kind=kind,
                         key=str(a.get("key") or ""),
-                        count=int(a.get("count") or 1),
-                        pre_delay=float(a.get("preDelay") or 0.0),
-                        interval=float(a.get("interval") or 0.0),
+                        count=int(field_or(a, "count", 1)),
+                        pre_delay=float(field_or(a, "preDelay", 0.0)),
+                        interval=float(field_or(a, "interval", 0.0)),
                         route_index=int(a.get("routeIndex") if a.get("routeIndex") is not None else 0),
                         dont_block_wave=bool(a.get("dontBlockWave", False)),
                         block_fragment=bool(a.get("blockFragment", False)),
@@ -422,7 +422,7 @@ def compile_scenario(
                 blackboard=nums,
                 value_str=strs,
                 profession_mask=parse_profession_mask(r.get("professionMask")),
-                buildable_mask=str(r.get("buildableMask") or "ALL"),
+                buildable_mask=str(field_or(r, "buildableMask", "ALL")),
             )
         )
 
@@ -469,8 +469,8 @@ def compile_scenario(
                 PredefinedUnit(
                     char_key=str(inst.get("characterKey") or ""),
                     tile=Tile(pos["row"], pos["col"]),
-                    direction=Direction.parse(str(u.get("direction") or "UP")),
-                    level=int(inst.get("level") or 1),
+                    direction=Direction.parse(str(field_or(u, "direction", "UP"))),
+                    level=int(field_or(inst, "level", 1)),
                     phase={"PHASE_0": 0, "PHASE_1": 1, "PHASE_2": 2}.get(
                         str(inst.get("phase") or "PHASE_0"), 0
                     ),
