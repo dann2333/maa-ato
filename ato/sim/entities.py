@@ -43,8 +43,14 @@ class Unit:
     position: Vec2
     state: UnitState = UnitState.ACTIVE
     uid: int = field(default_factory=lambda: next(_ids))
-    #: When this unit may next attack, in simulation seconds.
-    next_attack_at: float = 0.0
+    #: Tick index at which this unit may next attack. Deadlines are held in
+    #: ticks, not seconds, so that a cooldown lands on an exact tick boundary
+    #: instead of drifting by the representation error of ``1 / tps``.
+    next_attack_tick: int = 0
+    #: Fractional tick left over when the attack interval is not a whole number
+    #: of ticks, carried into the next interval so the long-run attack rate
+    #: stays exact. Zeroed when the calibration quantises intervals instead.
+    attack_carry: float = 0.0
     target_uid: int | None = None
 
     @property
@@ -185,7 +191,17 @@ class OperatorUnit(Unit):
     #: Enemies currently blocked, in the order they were blocked. The game
     #: releases block slots in arrival order, so a list, not a set.
     blocking: list[int] = field(default_factory=list)
-    sp: float = 0.0
+    #: SP held in *tick units*: one unit is one tick of charging at 1 SP/s.
+    #: A 30-SP skill has to be ready at exactly 30.0 s, and summing ``1/30``
+    #: thirty times falls short of 1.0 while summing ``1.0`` thirty times does
+    #: not -- see :mod:`ato.sim.timing`. Read :attr:`sp` for the SP value.
+    sp_ticks: float = 0.0
+    #: Ticks per simulated second, set by the engine when the unit is created.
+    tick_rate: int = 30
+    #: Enemy uids inside this operator's range as of the last target scan. The
+    #: client rescans every few frames rather than every frame, so the list is
+    #: deliberately stale between scans.
+    scan_targets: tuple[int, ...] = ()
     skill_active_until: float = 0.0
     #: Set while the skill is running so effect modifiers can be removed cleanly.
     skill_modifier_source: str = ""
@@ -231,21 +247,36 @@ class OperatorUnit(Unit):
 
     # -- skill -----------------------------------------------------------
 
+    @property
+    def sp(self) -> float:
+        return self.sp_ticks / self.tick_rate
+
+    @property
+    def sp_cost_ticks(self) -> float:
+        return self.skill.sp_cost * self.tick_rate if self.skill is not None else 0.0
+
+    def set_sp(self, sp: float) -> None:
+        self.sp_ticks = sp * self.tick_rate
+
     def sp_ready(self) -> bool:
-        return self.skill is not None and self.sp >= self.skill.sp_cost
+        return self.skill is not None and self.sp_ticks >= self.sp_cost_ticks
 
     def charge_sp(self, amount: float) -> None:
+        """Add whole SP. See :meth:`charge_sp_ticks` for the per-tick form."""
+        self.charge_sp_ticks(amount * self.tick_rate)
+
+    def charge_sp_ticks(self, ticks: float) -> None:
         """SP does not accumulate past the cost, and is frozen while the skill runs."""
         if self.skill is None or self.skill_active or self.stats.silenced:
             return
-        self.sp = min(self.sp + amount, self.skill.sp_cost)
+        self.sp_ticks = min(self.sp_ticks + ticks, self.sp_cost_ticks)
 
     def start_skill(self, now: float) -> bool:
         if self.skill is None or not self.sp_ready() or self.skill_active:
             return False
         if self.stats.silenced or not self.stats.can_act:
             return False
-        self.sp -= self.skill.sp_cost
+        self.sp_ticks -= self.sp_cost_ticks
         # A zero-duration skill is instantaneous (a one-shot effect); the engine
         # applies its effect and never sets an end time.
         self.skill_active_until = now + self.skill.duration if self.skill.duration > 0 else 0.0

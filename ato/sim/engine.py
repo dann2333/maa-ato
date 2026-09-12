@@ -18,6 +18,7 @@ that may be wrong (INVARIANT I-5).
 from __future__ import annotations
 
 import copy
+import math
 import random
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -47,6 +48,7 @@ from ato.sim.entities import (
 from ato.sim.pathing import build_route_program
 from ato.sim.registry import MechanismKind, NoveltyLog
 from ato.sim.scenario import Scenario, WaveAction
+from ato.sim.timing import PeriodicGrant, ticks_for
 from ato.sim.types import BattleResult, DamageType, Direction, Side, Tile, Vec2
 
 
@@ -85,6 +87,24 @@ class EngineCalibration:
 
     #: Whether an operator starts with its skill's ``initSp``.
     grant_initial_sp: bool = True
+
+    #: Clamp on effective attack speed, in percent. The floor is disputed
+    #: between sources (10 vs 20) and the ceiling was simply missing, which let
+    #: a buffed unit reach a 0.05 s attack interval. Registered in SIM_SPEC B-13.
+    aspd_min: float = 20.0
+    aspd_max: float = 600.0
+
+    #: How an attack interval that is not a whole number of ticks is resolved.
+    #: ``"none"`` carries the remainder so the long-run rate is exact;
+    #: ``"ceil"`` / ``"round"`` quantise each interval to whole ticks the way a
+    #: fixed-step client loop does. Which one the client does is unmeasured,
+    #: so it is a calibration switch and a randomisation axis, not a decision.
+    attack_quantization: str = "none"
+
+    #: How often an operator rescans for targets, in ticks. The client is
+    #: reported to scan every third frame; scanning every tick would make
+    #: operators react up to two frames faster than they can. SIM_SPEC B-8.
+    target_scan_period_ticks: int = 3
 
 
 #: Profession -> damage type. Operators have no explicit damage-type field, so it
@@ -336,8 +356,15 @@ class BattleEngine:
             total_enemies=scenario.enemy_count,
         )
         self.state.cost = float(scenario.options.initial_cost)
-        self._cost_accum = 0.0
+        #: Ticks elapsed. The authoritative clock: ``state.time`` is derived
+        #: from it by a single division, never accumulated, so tick ``k`` is
+        #: always exactly ``k / tps`` and periodic events land on the right one.
+        self.tick_index = 0
+        self._aspd_bounds = (self.cal.aspd_min, self.cal.aspd_max)
         self._cost_rate_scale = 1.0
+        self._cost_grant = PeriodicGrant(
+            scenario.options.cost_increase_time, self.tps, self._cost_rate_scale
+        )
         self._units: dict[int, OperatorUnit | EnemyUnit] = {}
         self._programs: dict[int, tuple] = {}
         #: Per-operator record of when each enemy entered its range, so that the
@@ -346,6 +373,11 @@ class BattleEngine:
         self._wave_enemy_uids: set[int] = set()
         self.scheduler = WaveScheduler(scenario, self.cal)
         self._apply_runes()
+        # Runes may scale cost recovery, so the accrual schedule is built after
+        # them rather than before.
+        self._cost_grant = PeriodicGrant(
+            scenario.options.cost_increase_time, self.tps, self._cost_rate_scale
+        )
 
     # -- setup -----------------------------------------------------------
 
@@ -375,7 +407,10 @@ class BattleEngine:
             elif rune.key == "global_initial_cost_add":
                 self.state.cost += bb.get("value", 0.0)
             elif rune.key in ("cbuff_cost_recovery", "global_cost_recovery_mul"):
-                self._cost_rate_scale *= bb.get("scale", bb.get("value", 1.0)) or 1.0
+                scale = bb.get("scale")
+                if scale is None:
+                    scale = bb.get("value")
+                self._cost_rate_scale *= 1.0 if scale is None else float(scale)
 
     def enemy_stat_multipliers(self) -> dict[str, float]:
         """Rune-driven multipliers applied to every spawned enemy."""
@@ -416,7 +451,7 @@ class BattleEngine:
         if not ok:
             return None
         entry = self.roster[char_id]
-        stats = StatBlock(entry.spec.stats)
+        stats = StatBlock(entry.spec.stats, self._aspd_bounds)
         unit = OperatorUnit(
             spec_name=entry.spec.name,
             side=Side.PLAYER,
@@ -431,9 +466,12 @@ class BattleEngine:
             deploy_time=self.state.time,
         )
         unit.place(tile, direction)
+        unit.tick_rate = self.tps
         if entry.skill is not None and self.cal.grant_initial_sp:
-            unit.sp = min(entry.skill.init_sp, entry.skill.sp_cost)
-        unit.next_attack_at = self.state.time + self.cal.deploy_lock_seconds
+            unit.set_sp(min(entry.skill.init_sp, entry.skill.sp_cost))
+        unit.next_attack_tick = self.tick_index + ticks_for(
+            self.cal.deploy_lock_seconds, self.tps
+        )
         self.state.cost -= entry.cost
         entry.deploys_used += 1
         self.state.operators.append(unit)
@@ -464,7 +502,8 @@ class BattleEngine:
     def tick(self) -> BattleResult:
         if self.state.result is not BattleResult.RUNNING:
             return self.state.result
-        now = self.state.time = round(self.state.time + self.dt, 6)
+        self.tick_index += 1
+        now = self.state.time = self.tick_index / self.tps
 
         self._accrue_cost()
         self._expire(now)
@@ -490,14 +529,18 @@ class BattleEngine:
     # -- loop stages ------------------------------------------------------
 
     def _accrue_cost(self) -> None:
-        opt = self.sc.options
-        if opt.cost_increase_time <= 0:
+        """Grant DP on exact tick boundaries.
+
+        DP timing decides when every deployment can happen, so a systematic
+        error here shifts every plan the simulator produces. Overflow past
+        ``max_cost`` is discarded rather than banked: the client stops the
+        meter at the cap, it does not pay it out later.
+        """
+        gained = self._cost_grant.tick()
+        if not gained:
             return
-        self._cost_accum += self.dt * self._cost_rate_scale / opt.cost_increase_time
-        if self._cost_accum >= 1.0:
-            gained = int(self._cost_accum)
-            self._cost_accum -= gained
-            self.state.cost = min(self.state.cost + gained, float(opt.max_cost))
+        cap = float(self.sc.options.max_cost)
+        self.state.cost = min(self.state.cost + gained, cap)
 
     def _expire(self, now: float) -> None:
         for u in self._units.values():
@@ -559,7 +602,7 @@ class BattleEngine:
         unit = EnemyUnit(
             spec_name=spec.name,
             side=Side.ENEMY,
-            stats=StatBlock(base),
+            stats=StatBlock(base, self._aspd_bounds),
             hp=base.max_hp,
             position=pos,
             spec=spec,
@@ -629,7 +672,10 @@ class BattleEngine:
             if sk is None or op.state is not UnitState.ACTIVE:
                 continue
             if sk.sp_type == "INCREASE_WITH_TIME":
-                op.charge_sp(self.dt * self.cal.sp_per_second * op.stats.sp_recovery_per_sec)
+                # One tick of charging is exactly the per-second rate in tick
+                # units; dividing by the tick rate here is what used to make a
+                # 30-SP skill take 31 s.
+                op.charge_sp_ticks(self.cal.sp_per_second * op.stats.sp_recovery_per_sec)
             if sk.is_auto and op.sp_ready() and not op.skill_active:
                 self._activate_skill(op)
 
@@ -670,46 +716,89 @@ class BattleEngine:
 
     # -- attacking --------------------------------------------------------
 
-    def _act_operators(self, now: float) -> None:
-        """Let every ready operator take its attack.
+    def _schedule_next_attack(self, unit: OperatorUnit | EnemyUnit) -> None:
+        """Set the tick at which ``unit`` may attack again.
 
-        Enemies are bucketed by tile once per tick so an operator only looks at
-        the tiles its range actually covers, instead of filtering the whole
-        enemy list per operator.
+        Whether the client quantises each interval to whole frames or lets the
+        remainder carry is unmeasured, and the two differ by up to 4% DPS, so
+        both are available and neither is baked in. ``max(1, ...)`` means the
+        simulator cannot model more than one attack per tick; at 30 Hz that
+        bites only below a 0.033 s interval, which no real unit reaches.
         """
-        deployed = self.state.deployed
-        if not deployed:
-            return
+        raw = unit.stats.attack_interval * self.tps + unit.attack_carry
+        mode = self.cal.attack_quantization
+        n = max(1, int(round(raw) if mode == "round" else math.ceil(raw - 1e-9)))
+        unit.attack_carry = raw - n if mode == "none" else 0.0
+        unit.next_attack_tick = self.tick_index + n
+
+
+    def _rescan_targets(self, now: float) -> None:
+        """Refresh what every operator can see.
+
+        Enemies are bucketed by tile once so an operator only looks at the
+        tiles its range actually covers, instead of filtering the whole enemy
+        list per operator.
+        """
         occupancy: dict[Tile, list[EnemyUnit]] = {}
         for e in self.state.enemies:
             if e.state is UnitState.ACTIVE:
                 occupancy.setdefault(e.position.tile, []).append(e)
 
-        for op in deployed:
-            if op.state is not UnitState.ACTIVE or not op.stats.can_act:
+        for op in self.state.deployed:
+            if op.state is not UnitState.ACTIVE:
+                op.scan_targets = ()
                 continue
             seen = self._in_range_since.setdefault(op.uid, {})
-            in_range: list[EnemyUnit] = []
+            in_range: list[int] = []
             for t in op.covered_tiles():
                 bucket = occupancy.get(t)
                 if bucket:
-                    in_range.extend(bucket)
+                    in_range.extend(e.uid for e in bucket)
             if in_range:
-                fresh = {e.uid for e in in_range}
-                for e in in_range:
-                    seen.setdefault(e.uid, now)
+                fresh = set(in_range)
+                for uid in in_range:
+                    seen.setdefault(uid, now)
                 if len(seen) > len(fresh):
                     for uid in [u for u in seen if u not in fresh]:
                         del seen[uid]
             elif seen:
                 seen.clear()
-            if now < op.next_attack_at or not in_range:
+            op.scan_targets = tuple(in_range)
+
+    def _act_operators(self, now: float) -> None:
+        """Let every ready operator take its attack.
+
+        Target acquisition runs on its own, slower cadence: the client rescans
+        every few frames, so an operator that scans every tick would react to a
+        new enemy faster than any real one can. Firing still happens on the
+        tick the cooldown expires, against whatever the last scan saw -- making
+        the *attack* wait for a scan too would cost up to two frames of every
+        cooldown and quietly drop sustained DPS.
+        """
+        deployed = self.state.deployed
+        if not deployed:
+            return
+        if self.tick_index % max(1, self.cal.target_scan_period_ticks) == 0:
+            self._rescan_targets(now)
+
+        for op in deployed:
+            if op.state is not UnitState.ACTIVE or not op.stats.can_act:
                 continue
+            if self.tick_index < op.next_attack_tick or not op.scan_targets:
+                continue
+            in_range = [
+                e
+                for e in (self._units.get(uid) for uid in op.scan_targets)
+                if isinstance(e, EnemyUnit) and e.state is UnitState.ACTIVE
+            ]
+            if not in_range:
+                continue
+            seen = self._in_range_since.setdefault(op.uid, {})
             target = self._pick_operator_target(op, in_range, seen)
             if target is None:
                 continue
             self._strike(op, target, now)
-            op.next_attack_at = now + op.stats.attack_interval
+            self._schedule_next_attack(op)
             if op.skill is not None and op.skill.sp_type == "INCREASE_WHEN_ATTACK":
                 op.charge_sp(self.cal.sp_per_attack)
 
@@ -734,10 +823,10 @@ class BattleEngine:
             target = self._pick_enemy_target(e)
             if target is None:
                 continue
-            if now < e.next_attack_at:
+            if self.tick_index < e.next_attack_tick:
                 continue
             self._strike(e, target, now)
-            e.next_attack_at = now + e.stats.attack_interval
+            self._schedule_next_attack(e)
 
     def _pick_enemy_target(self, e: EnemyUnit) -> OperatorUnit | None:
         if e.blocked_by is not None:
