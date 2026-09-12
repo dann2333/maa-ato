@@ -64,6 +64,16 @@ class EnsembleVerdict:
 ROBUST_CLEAR_RATE = 0.85
 FRAGILE_CLEAR_RATE = 0.5
 
+#: Perturbed runs per verdict. Measured, not guessed: at ``n=10`` the same plan
+#: on the same stage came back fragile / robust / fragile for seeds 7 / 11 / 23,
+#: because a 0.85 threshold sits between two attainable sample rates (0.8 and
+#: 0.9). A verdict that flips with the seed is worse than no verdict -- it is a
+#: coin toss wearing a name. At 40 it was stable across the same seeds. It is
+#: still only about one standard error from the threshold, so report ``n``
+#: alongside the verdict and do not read a single run as settled. See
+#: SIM_SPEC E-7.
+DEFAULT_ENSEMBLE_N = 40
+
 EngineFactory = Callable[[EngineCalibration], BattleEngine]
 
 
@@ -71,7 +81,7 @@ def evaluate_plan(
     make_engine: EngineFactory,
     plan: Plan,
     *,
-    n: int = 8,
+    n: int = DEFAULT_ENSEMBLE_N,
     seed: int = 0,
     strength: float = 1.0,
     cards: list[str] | None = None,

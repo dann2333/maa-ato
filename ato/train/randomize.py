@@ -139,9 +139,10 @@ def sample_calibration(
         lo_s = 1.0 + (lo - 1.0) * strength
         hi_s = 1.0 + (hi - 1.0) * strength
         kw[name] = cur * rng.uniform(lo_s, hi_s)
-    if kw["aspd_min"] >= kw["aspd_max"]:      # never invert the clamp
-        kw["aspd_min"] = cal.aspd_min
-        kw["aspd_max"] = cal.aspd_max
+    if kw.get("aspd_min", cal.aspd_min) >= kw.get("aspd_max", cal.aspd_max):
+        # Two independent draws can cross; a clamp with its ends swapped is not
+        # a hypothesis about the game, it is a broken simulator.
+        kw["aspd_min"], kw["aspd_max"] = cal.aspd_min, cal.aspd_max
     # The remaining unknowns are discrete, so they are sampled as one reading
     # rather than smeared: the policy should be robust to either, not tuned to
     # the midpoint of two things neither of which the game does.

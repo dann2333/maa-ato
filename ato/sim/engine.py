@@ -360,11 +360,7 @@ class BattleEngine:
         #: from it by a single division, never accumulated, so tick ``k`` is
         #: always exactly ``k / tps`` and periodic events land on the right one.
         self.tick_index = 0
-        self._aspd_bounds = (self.cal.aspd_min, self.cal.aspd_max)
         self._cost_rate_scale = 1.0
-        self._cost_grant = PeriodicGrant(
-            scenario.options.cost_increase_time, self.tps, self._cost_rate_scale
-        )
         self._units: dict[int, OperatorUnit | EnemyUnit] = {}
         self._programs: dict[int, tuple] = {}
         #: Per-operator record of when each enemy entered its range, so that the
@@ -451,7 +447,7 @@ class BattleEngine:
         if not ok:
             return None
         entry = self.roster[char_id]
-        stats = StatBlock(entry.spec.stats, self._aspd_bounds)
+        stats = StatBlock(entry.spec.stats, (self.cal.aspd_min, self.cal.aspd_max))
         unit = OperatorUnit(
             spec_name=entry.spec.name,
             side=Side.PLAYER,
@@ -602,7 +598,7 @@ class BattleEngine:
         unit = EnemyUnit(
             spec_name=spec.name,
             side=Side.ENEMY,
-            stats=StatBlock(base, self._aspd_bounds),
+            stats=StatBlock(base, (self.cal.aspd_min, self.cal.aspd_max)),
             hp=base.max_hp,
             position=pos,
             spec=spec,
