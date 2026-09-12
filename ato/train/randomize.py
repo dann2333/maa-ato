@@ -104,6 +104,23 @@ CALIBRATION_BANDS: dict[str, tuple[float, float]] = {
     "sp_per_second": (0.95, 1.05),
     "sp_per_attack": (0.90, 1.10),
     "sp_per_hit_taken": (0.90, 1.10),
+    # The floor is disputed between sources (10 vs 20) and the ceiling has no
+    # source at all, so the band spans the disagreement rather than picking a
+    # winner. Base 20 x [0.5, 1.0] covers both reported floors.
+    "aspd_min": (0.50, 1.00),
+    "aspd_max": (0.83, 1.17),
+}
+
+#: Calibration unknowns that are *discrete*, so they are sampled as one of a few
+#: readings rather than smeared over a range. A policy that only works under one
+#: reading of an unmeasured rule has learned the reading, not the game.
+CALIBRATION_CHOICES: dict[str, tuple[object, ...]] = {
+    # Whether a fixed-step client quantises each attack interval to whole
+    # frames, and how it rounds. Worth ~4% DPS at baseAttackTime 0.78.
+    "attack_quantization": ("none", "ceil", "round"),
+    # How often the client rescans for targets. Reported as every third frame;
+    # nothing measures it.
+    "target_scan_period_ticks": (1, 2, 3),
 }
 
 
@@ -116,16 +133,24 @@ def sample_calibration(
     evaluation), 1 uses the full band (for training).
     """
     cal = base or EngineCalibration()
-    kw: dict[str, float | bool] = {}
+    kw: dict[str, object] = {}
     for name, (lo, hi) in CALIBRATION_BANDS.items():
         cur = getattr(cal, name)
         lo_s = 1.0 + (lo - 1.0) * strength
         hi_s = 1.0 + (hi - 1.0) * strength
         kw[name] = cur * rng.uniform(lo_s, hi_s)
-    # The fragment-delay semantics is a *discrete* unknown, so it is sampled as
-    # one rather than smeared: the policy should be robust to either reading.
-    if strength > 0.0 and rng.random() < 0.25 * strength:
-        kw["fragment_relative_delays"] = not cal.fragment_relative_delays
+    if kw["aspd_min"] >= kw["aspd_max"]:      # never invert the clamp
+        kw["aspd_min"] = cal.aspd_min
+        kw["aspd_max"] = cal.aspd_max
+    # The remaining unknowns are discrete, so they are sampled as one reading
+    # rather than smeared: the policy should be robust to either, not tuned to
+    # the midpoint of two things neither of which the game does.
+    if strength > 0.0:
+        if rng.random() < 0.25 * strength:
+            kw["fragment_relative_delays"] = not cal.fragment_relative_delays
+        for name, options in CALIBRATION_CHOICES.items():
+            if rng.random() < strength:
+                kw[name] = rng.choice(options)
     return replace(cal, **kw)
 
 

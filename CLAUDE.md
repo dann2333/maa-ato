@@ -21,7 +21,7 @@ ATO = 一个**真正会玩明日方舟**的 AI。不是自动化脚本，不是�
 
 ---
 
-## 1. 七条不可违反的约束
+## 1. 九条不可违反的约束
 
 | # | 约束 | 执行机制 |
 |---|------|----------|
@@ -36,6 +36,14 @@ ATO = 一个**真正会玩明日方舟**的 AI。不是自动化脚本，不是�
 | I-9 | **真实对局是第一学习信号**，模拟器是被校验的前瞻模型 | 每场实机对局产出学习轨迹 + 发散报告 + novelty 标记；计划须过标定集成检验 |
 
 **训练一律 `strict=True`。** 模拟器算不准的关卡绝不能产生奖励信号。
+
+**定时一律走整数 tick，不要用浮点累加。** 30 Hz 下 `sum(30 × 1/30) < 1.0`，
+任何"每 tick 加一点、加满就触发"的写法都会慢约 3%（DP、SP、冷却全中招）。
+周期用 `ato.sim.timing.PeriodicGrant`（精确整数比），速率用 **tick 单位**累加
+（每 tick 加"每秒速率"这个好数，只在比较时除以 tick 率）。
+`state.time` 由 tick 计数一次除法导出，**不许累加**。
+这类误差最坏的地方不是它错，而是**标定会吸收它**——
+CMA-ES 会用别处的偏差把它补回来，于是每个常数都错了而整体"看起来很准"。
 
 **模拟器的可信度是被测量的，不是被假设的。** `ato.fidelity.FidelityLedger` 按关卡记录
 sim-vs-real 对拍证据，给出 `UNKNOWN / UNTRUSTED / TRIAGE / IMITATION / PLANNING / TRAINING`
@@ -75,6 +83,11 @@ sim-vs-real 对拍证据，给出 `UNKNOWN / UNTRUSTED / TRIAGE / IMITATION / PL
 - 敌人伤害类型在 `enemy_handbook_table.damageType`：`PHYSIC / MAGIC / NO_DAMAGE / HEAL`；
   `enemyLevel` 为 `NORMAL / ELITE / BOSS`。
 - `options.moveMultiplier` 在抽样的 58 个关卡里**恒为 0.5** → 它是全局速度换算系数，不是关卡旋钮。
+- **零是合法取值，不是"字段缺失"**：`initialCost: 0`（66 关抽样中 3 关）、`moveSpeed: 0`（不动的敌人）、
+  `spRecoveryPerSec: 0`（不自动回 SP）、波次 `count: 0`（不出怪）都真实存在。
+  解析一律走 `ato.gamedata.models.field_or`（`is None` 判定），**永远不要写 `node.get(k) or default`**。
+- `costIncreaseTime` 存在合法值 `999999.0`（该关几乎不回费）；`initialCost` 观测域
+  `[0, 3, 5, 10, 15, 16, 18, 20, 24, 30, 35, 45, 50]`。
 
 ---
 
