@@ -15,6 +15,7 @@ from ato.sim.registry import (
     motion_mode,
     wave_action_type,
 )
+from ato.sim.pathing import parse_route
 
 # Declaration order recovered from int-serialised level files; these indices are
 # the contract every older level file depends on.
@@ -93,13 +94,51 @@ def test_wave_action_type_unknown() -> None:
         ("WALK", "WALK"),
         ("FLY", "FLY"),
         ("fly", "FLY"),
-        ("E_NUM", "WALK"),      # padding slots
-        (-1, "WALK"),           # UNKNOWN_-1 folds back to the safe default
+        # Neither of the next two folds back to WALK. Guessing WALK for a mode
+        # we did not recognise puts a ground enemy on a path only a flier can
+        # take -- a route that looks entirely plausible and is simply wrong.
+        ("E_NUM", "E_NUM"),     # the client's padding marker, passed through
+        (-1, "UNKNOWN_-1"),     # out of range: named, not defaulted
         (None, "NONE"),
     ],
 )
 def test_motion_mode(value: object, expected: str) -> None:
     assert motion_mode(value) == expected
+
+
+@pytest.mark.parametrize("mode", [-1, "SWIM"])
+def test_unrecognised_motion_drops_the_route_and_reports_novelty(mode: object) -> None:
+    """The string the normaliser returns only matters through what the parser does with it.
+
+    A route the simulator cannot place must not become a walking route; it has
+    to disappear and be reported, so that nothing downstream can be trained on
+    a movement pattern that was invented here.
+    """
+    raw = {
+        "motionMode": mode,
+        "startPosition": {"row": 0, "col": 0},
+        "endPosition": {"row": 3, "col": 3},
+        "checkpoints": [],
+    }
+    log = NoveltyLog(strict=False)
+    assert parse_route(0, raw, log) is None
+    assert [e.key for e in log.events] == [motion_mode(mode)]
+
+    with pytest.raises(UnknownMechanism):
+        parse_route(0, raw, NoveltyLog(strict=True))
+
+
+def test_padding_route_slot_is_not_novelty() -> None:
+    """``E_NUM`` on an empty slot is the client padding its array, not a new mechanic."""
+    log = NoveltyLog(strict=True)
+    raw = {
+        "motionMode": "E_NUM",
+        "startPosition": {"row": 0, "col": 0},
+        "endPosition": {"row": 0, "col": 0},
+        "checkpoints": [],
+    }
+    assert parse_route(7, raw, log) is None
+    assert not log.events
 
 
 def test_registry_register_and_lookup() -> None:
