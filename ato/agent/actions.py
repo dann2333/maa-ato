@@ -73,6 +73,11 @@ class Trigger:
     kind: TriggerKind = TriggerKind.IMMEDIATE
     value: float = 0.0
 
+    def describe(self) -> str:
+        if self.kind is TriggerKind.IMMEDIATE:
+            return "IMMEDIATE"
+        return f"{self.kind.name}>={self.value:g}"
+
     def satisfied(self, *, kills: int, cost: float, elapsed: float, cost_drop: float) -> bool:
         if self.kind is TriggerKind.IMMEDIATE:
             return True
@@ -112,7 +117,7 @@ class Plan:
 
     def describe(self) -> str:
         return "\n".join(
-            f"{i:2d}. [{s.trigger.kind.name}>={s.trigger.value:g}] {s.action.describe()}"
+            f"{i:2d}. [{s.trigger.describe()}] {s.action.describe()}"
             + (f"  # {s.note}" if s.note else "")
             for i, s in enumerate(self.steps)
         )

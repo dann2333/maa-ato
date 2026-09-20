@@ -1152,6 +1152,107 @@ def _operator_payload(
     }
 
 
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+
+
+def _resolve_squad(gd: GameData, tokens: list[str]) -> list[str]:
+    """Accept char ids or names; report every bad one at once, not just the first."""
+    out, bad = [], []
+    for tok in tokens:
+        try:
+            char_id, _ = _find_operator(gd, tok)
+        except CliError:
+            bad.append(tok)
+        else:
+            out.append(char_id)
+    if bad:
+        raise CliError(f"no operator matching {', '.join(repr(b) for b in bad)}")
+    if not out:
+        raise CliError("--squad is empty")
+    return out
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    from ato.agent.search import PlannerConfig, plan_stage
+    from ato.sim.engine import BattleEngine, EngineCalibration, make_roster
+
+    gd = _open_gamedata(args.server)
+    stage_id, _stage, want, sc = _load_scenario(gd, args.stage, args.difficulty)
+    squad = _resolve_squad(gd, [t for chunk in args.squad for t in chunk.split(",") if t.strip()])
+
+    def build(cal: EngineCalibration) -> BattleEngine:
+        roster = make_roster(
+            gd, squad, phase=args.phase, level=args.level, mastery=args.mastery
+        )
+        # strict=False: an unmodelled mechanic is reported here, not raised. It
+        # is still fatal for *training* -- that gate is the fidelity ledger,
+        # which --check consults.
+        return BattleEngine(sc, gd, roster, calibration=cal, strict=False)
+
+    result = plan_stage(build(EngineCalibration()), PlannerConfig(rollout_budget=args.rollouts))
+    payload: dict[str, Any] = {
+        "stage": stage_id,
+        "difficulty": want.name,
+        "squad": squad,
+        "summary": result.summary,
+        "rollouts_used": result.rollouts_used,
+        "steps": [
+            {
+                "index": i,
+                "action": step.action.describe(squad),
+                "trigger": step.trigger.describe(),
+                "note": step.note,
+            }
+            for i, step in enumerate(result.plan.steps)
+        ],
+    }
+
+    if args.check:
+        from ato.fidelity.ensemble import evaluate_plan
+        from ato.fidelity.ledger import FidelityLedger
+
+        verdict = evaluate_plan(build, result.plan, seed=args.seed)
+        ledger = FidelityLedger(gamedata_version=gd.version)
+        for div in verdict.divergences:
+            ledger.observe(div, scope=stage_id)
+        payload["check"] = {
+            "verdict": verdict.summary(),
+            "trust": ledger.trust(stage_id).name,
+            "allows_training": ledger.allows_training(stage_id),
+        }
+
+    if args.as_json:
+        _dump_json(payload)
+        return EXIT_OK
+
+    print(f"stage      {stage_id} ({want.name})")
+    print(f"squad      {', '.join(squad)}")
+    print(f"result     {result.summary.get('result')}  "
+          f"kills={result.summary.get('kills')}/{result.summary.get('total_enemies')}  "
+          f"leaked={result.summary.get('leaked')}  "
+          f"life={result.summary.get('life_points')}  "
+          f"({result.rollouts_used} rollouts)")
+    print()
+    for row in payload["steps"]:
+        print(f" {row['index']:>2}. [{row['trigger']}] {row['action']}"
+              + (f"   # {row['note']}" if row["note"] else ""))
+    if not payload["steps"]:
+        print(" (empty plan — the planner deployed nothing)")
+    for note in result.summary.get("novelty") or ():
+        print(f"  ! {note}")
+
+    if args.check:
+        c = payload["check"]
+        print()
+        print(f"fidelity   {c['verdict']}")
+        print(f"trust      {c['trust']}   allows_training={c['allows_training']}")
+        if not c["allows_training"]:
+            print("           (sim-vs-sim evidence only; grounding needs a real-device run)")
+    return EXIT_OK
+
+
 def cmd_op_show(args: argparse.Namespace) -> int:
     gd = _open_gamedata(args.server)
     char_id, char = _find_operator(gd, args.query)
@@ -1340,6 +1441,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_stage_routes)
 
     # -- op ---------------------------------------------------------------
+    plan = groups.add_parser(
+        "plan", parents=[common, jsonable],
+        help="search a plan for a stage in the offline simulator",
+    )
+    plan.set_defaults(usage_parser=plan, func=cmd_plan)
+    plan.add_argument("stage", help="stage id (main_01-07) or code (1-7)")
+    plan.add_argument(
+        "--squad", action="append", required=True, metavar="OP[,OP...]",
+        help="operators by char id or name; repeatable, or comma-separated",
+    )
+    plan.add_argument("--phase", type=int, default=2, help="elite phase (default: 2)")
+    plan.add_argument("--level", type=int, default=None, help="level (default: max for the phase)")
+    plan.add_argument("--mastery", type=int, default=6, help="skill level index (default: 6)")
+    plan.add_argument("--difficulty", default=None, help="force NORMAL or FOUR_STAR (Adverse)")
+    plan.add_argument(
+        "--rollouts", type=int, default=400, help="rollout budget (default: 400)"
+    )
+    plan.add_argument(
+        "--check", action="store_true",
+        help="also run the calibration ensemble and report the trust level",
+    )
+    plan.add_argument("--seed", type=int, default=0, help="ensemble seed (default: 0)")
+
     op = groups.add_parser("op", help="operators")
     op.set_defaults(usage_parser=op)
     op_sub = op.add_subparsers(dest="command", metavar="COMMAND")
