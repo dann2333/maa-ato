@@ -96,3 +96,45 @@ tile z = `heightType × -0.4`）。16:9 下无需额外适配。
 1. 是否接受用非官方 API 客户端拉取自己账号的战斗日志（账号风险 vs 精确校准 oracle）
 2. 是否接受解包客户端（5.2 MB 的 4 个 bundle 是全项目每字节价值最高的一步）
 3. B 站视频预算（建议 200–400 小时 / 50–90 GB，而非 2,000 小时）
+
+## 8. MAA 自带的关卡资源（已核实，2026-09）
+
+克隆 `MaaAssistantArknights/MaaAssistantArknights`（AGPL-3.0，与本项目的
+AGPL-3.0-or-later 兼容）逐项看过。**它替我们省掉的是感知层的冷启动，不是标定。**
+
+### 有什么
+
+| 资源 | 规模 | 对我们的价值 |
+|---|---|---|
+| `resource/Arknights-Tile-Pos/*.json` | **4,203 关** | 见下，**最有价值的一项** |
+| `resource/template/` | 2,509 张模板图 | UI 元素匹配，感知栈可直接对照 |
+| `resource/PaddleOCR` / `PaddleCharOCR` / `onnx` | — | 现成 OCR 模型与配置 |
+| `resource/battle_data.json` | — | 干员 `position` / `profession` / `rangeId` + 五语种名字 |
+| `resource/tasks/` | 84 个文件 | 每个 UI 流程的 ROI、阈值、识别算法 |
+| `resource/stages.json` | — | 关卡 code / 理智消耗 / 掉落 |
+| `resource/global/` | 2,246 个文件 | 其它服的差异资源 |
+
+### `Arknights-Tile-Pos` 的关键点
+
+每关一个文件，除了地格网格之外还带一个 **`view` 块**——两组三维相机位置
+（正常视角与俯视视角），例：`main_01-07#f#` 的 `view` 为
+`[[0.0, -4.81, -7.76], [0.598, -5.31, -8.642]]`。
+
+- **地格网格本身对我们是冗余的**：`buildableType` / `heightType` / `tileKey`
+  我们已经从 ArknightsGameData 解析了，同源。
+- **`view` 不是冗余的**：它正是 `ato/control/projection.py` 里
+  `PerspectiveProjector` / `CameraParams` 需要的输入。有了它，屏幕↔格子的映射
+  可以**直接算**，不必从截图拟合单应性。这把感知栈最麻烦的一块去掉了。
+- 注意文件名里的 `#f#`：MAA 按 **stageId** 命名，所以突袭与普通关是两个文件；
+  我们按 levelId 组织，接入时要做一次映射（`overview.json` 给了 levelId → 文件名）。
+
+### 没有什么（这才是要害）
+
+**MAA 不含任何 sim-vs-real 配对轨迹。** 没有人会发布"在 1-7 上跑了这个计划、
+第 7 只敌人在 t=43.2s 死亡"这样的数据——因为 MAA 不模拟任何东西，它是执行脚本的
+UI 自动化，不需要标定。而 `ato.fidelity.FidelityLedger` 要的恰好就是这个。
+
+**结论**：MAA 把本机录制的任务从"什么都要"缩小到"只要标定 oracle"，
+但**没有取消它**。1-7 仍然停在 `UNTRUSTED`，仍然要一次计划驱动的实机对拍才能往上走。
+
+**不要把 MAA 的资源拷进本仓库**（CLAUDE.md §4：游戏数据永不入库），按需拉取。
